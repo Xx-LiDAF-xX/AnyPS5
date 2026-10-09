@@ -12,6 +12,8 @@ int APS5_VABI sceVideoOutOpen(int userId, int busType, int index, const void* pa
 int APS5_VABI sceVideoOutClose(int handle);
 int APS5_VABI sceVideoOutGetOutputStatus(int handle, VideoOutOutputStatus* status);
 int APS5_VABI sceVideoOutAllowOutputResolutionWqhdDetection(int handle);
+int APS5_VABI sceVideoOutVrrPegToFixedRate();
+int APS5_VABI sceVideoOutVrrUnpegFromFixedRate();
 }
 
 static constexpr int SYSTEM_USER = 255;
@@ -34,6 +36,8 @@ static bool SameStatus(const VideoOutOutputStatus& a, const VideoOutOutputStatus
 }
 
 int main() {
+    Require(sceVideoOutVrrPegToFixedRate() == 0);
+    Require(sceVideoOutVrrUnpegFromFixedRate() == 0);
     std::filesystem::create_directories("app0/sce_sys");
     {
         std::ofstream param("app0/sce_sys/param.json", std::ios::binary);

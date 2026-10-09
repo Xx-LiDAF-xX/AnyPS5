@@ -20,6 +20,8 @@ int APS5_VABI sceNpEntitlementAccessPollServiceEntitlementInfoList();
 int APS5_VABI sceRudpInit_nid_postfix(void*, int);
 int APS5_VABI sceRudpGetStatus(void*, std::size_t);
 int APS5_VABI sceRudpTerminate();
+int APS5_VABI sceNpAuthGetIdTokenV3(int, const void*, void*);
+int APS5_VABI sceNpWebApi2SetRequestTimeout();
 }
 
 static void Require(bool value) { if (!value) std::abort(); }
@@ -66,6 +68,14 @@ int main() {
     Require(sceNpEntitlementAccessPollUnifiedEntitlementInfoList() == signedOut);
     Require(sceNpEntitlementAccessRequestServiceEntitlementInfoList() == signedOut);
     Require(sceNpEntitlementAccessPollServiceEntitlementInfoList() == signedOut);
+
+    constexpr int invalidNpArgument = static_cast<int>(0x80550003);
+    std::array<unsigned char, 32> tokenParameter{};
+    std::array<unsigned char, 256> token{};
+    Require(sceNpAuthGetIdTokenV3(1, nullptr, token.data()) == invalidNpArgument);
+    Require(sceNpAuthGetIdTokenV3(1, tokenParameter.data(), nullptr) == invalidNpArgument);
+    Require(sceNpAuthGetIdTokenV3(1, tokenParameter.data(), token.data()) == signedOut);
+    Require(sceNpWebApi2SetRequestTimeout() == 0);
 
     std::array<unsigned char, 248> status;
     status.fill(0x5a);

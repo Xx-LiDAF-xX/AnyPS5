@@ -86,6 +86,9 @@ void TestNoDevice() {
     for (std::size_t i = 0; i < 256 * 8; ++i) Require(buffer[i] == 0);
     Require(buffer[256 * 8] == 0xCC);
     Require(sceAudioInInput(handle, nullptr) == 0);
+    const int compatibility = sceAudioInOpen(user, 1, 0, 128, 48000, 0x10);
+    Require(compatibility > 0);
+    Require(sceAudioInClose(compatibility) == 0);
     for (int port = 1; port < 8; ++port) Require(sceAudioInOpen(user, 1, 0, 128, 48000, 1) > 0);
     Require(sceAudioInOpen(user, 1, 0, 128, 48000, 1) == portFull);
     Require(sceAudioInClose(handle) == 0);

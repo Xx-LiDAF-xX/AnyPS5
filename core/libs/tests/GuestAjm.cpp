@@ -31,9 +31,17 @@ int APS5_VABI sceAjmBatchCancel(std::uint32_t, std::uint32_t);
 int APS5_VABI sceAjmBatchJobClearContext(AjmBatchInfo*, std::uint32_t, void*);
 int APS5_VABI sceAjmBatchJobSetResampleParameters(AjmBatchInfo*, std::uint32_t, float, std::uint32_t, void*);
 int APS5_VABI sceAjmBatchJobGetResampleInfo(AjmBatchInfo*, std::uint32_t, void*);
+const char* APS5_VABI sceAjmStrError(int);
 }
 
 static void Require(bool value) { if (!value) std::abort(); }
+
+static void TestErrorText() {
+    const char* first = sceAjmStrError(0);
+    const char* second = sceAjmStrError(static_cast<int>(0x80930005u));
+    Require(first != nullptr && first[0] != '\0');
+    Require(second != nullptr && std::strcmp(first, second) == 0);
+}
 
 namespace {
 
@@ -959,6 +967,7 @@ void TestResampleAt9(std::uint32_t context) {
 
 int main() {
     constexpr int invalidParameter = static_cast<int>(0x80930005);
+    TestErrorText();
     std::uint32_t context = 0;
     Require(sceAjmInitialize(0, nullptr) == invalidParameter);
     Require(sceAjmInitialize(0, &context) == 0 && context != 0);

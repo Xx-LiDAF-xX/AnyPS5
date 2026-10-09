@@ -51,8 +51,7 @@ int APS5_VABI sceAjmBatchJobSetResampleParametersEx(AjmBatchInfo* info, uint32_t
 
 const char* APS5_VABI sceAjmStrError(int error) {
  (void)error;
- AjmStub(__func__);
- return nullptr;
+ return "Unknown AJM error";
 }
 
 int APS5_VABI sceAjmDecWVorbisCreateHeaderPacket(void) {

@@ -51,7 +51,6 @@ int APS5_VABI sceAgcDcbSetWorkloadStreamInactive() {
 }
 
 int APS5_VABI sceAgcDebugRaiseException() {
- NotImplemented_nid_no_patch(__func__);
  return 0;
 }
 

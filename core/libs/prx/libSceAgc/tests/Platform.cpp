@@ -6,6 +6,7 @@
 #include <stdexcept>
 
 extern "C" int APS5_VABI sceAgcGetIsTrinityMode(bool* isTrinityMode);
+extern "C" int APS5_VABI sceAgcDebugRaiseException();
 
 namespace {
 
@@ -31,6 +32,10 @@ void testTrinityMode() {
     check(flags[0] && flags[2], "Trinity mode query wrote past its one-byte flag");
 }
 
+void testDebugExceptionFallback() {
+    check(sceAgcDebugRaiseException() == 0, "debug exception fallback failed");
+}
+
 void testRejections() {
     expectFailure([] { sceAgcGetIsTrinityMode(nullptr); });
 }
@@ -40,6 +45,7 @@ void testRejections() {
 int main() {
     try {
         testTrinityMode();
+        testDebugExceptionFallback();
         testRejections();
         LibcRunShutdown_nid_postfix();
         std::puts("AGC platform tests passed");

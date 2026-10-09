@@ -130,3 +130,5 @@ The report also lists needed libraries that have no file in `--libs` or `--modul
 Exit codes: `0` nothing blocks loading, `1` there are `absent` imports or needed libraries without a file, `2` an input could not be read; the message names the file and the value.
 
 The registry lists the imports of the executable, not of its bundled modules.
+
+For an installed launcher game, [`tools/compatibility_eval.py`](../../tools/compatibility_eval.py) combines this audit with optional CTest execution and a bounded launch probe. See the [compatibility evaluation guide](COMPATIBILITY_EVALUATION.md).

@@ -8,6 +8,9 @@ extern "C" {
 int APS5_VABI sceNpSessionSignalingInitialize(void* param);
 int APS5_VABI sceNpSessionSignalingCreateContext2(const void* param, std::uint32_t* contextId);
 std::int32_t APS5_VABI sceNpSessionSignalingGetLocalNetInfo(std::int32_t contextId, void* info);
+std::int32_t APS5_VABI sceNpSessionSignalingGetConnectionStatus(std::int32_t contextId, std::int32_t connectionId,
+                                                                std::int32_t* status, void* peerAddress,
+                                                                std::uint16_t* peerPort);
 int APS5_VABI sceNpSessionSignalingRequestPrepare(std::uint32_t contextId, std::uint32_t* requestId);
 int APS5_VABI sceNpSessionSignalingTerminate(void);
 }
@@ -46,6 +49,14 @@ int main() {
     Require(sceNpSessionSignalingGetLocalNetInfo(netContextId, nullptr) == InvalidArgument, "null info");
     Require(sceNpSessionSignalingGetLocalNetInfo(netContextId, info) == Unavailable, "local net info without network");
     Require(std::memcmp(info, untouched, sizeof(info)) == 0, "failed query modified the info");
+
+    std::int32_t status = -1;
+    std::uint16_t peerPort = 0xffff;
+    Require(sceNpSessionSignalingGetConnectionStatus(netContextId, 1, nullptr, nullptr, nullptr) == InvalidArgument,
+            "null connection status");
+    Require(sceNpSessionSignalingGetConnectionStatus(netContextId, 1, &status, nullptr, &peerPort) == 0,
+            "offline connection status failed");
+    Require(status == 0 && peerPort == 0, "offline connection status was not disconnected");
 
     Require(sceNpSessionSignalingTerminate() == 0, "terminate failed");
 }

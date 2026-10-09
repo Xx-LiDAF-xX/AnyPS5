@@ -26,7 +26,11 @@ int main(int argc, char* argv[]) {
             std::cerr << "FAIL: " << Launcher::PathToUtf8(input) << ": synthetic relinker failure\n";
             return 2;
         }
-        Write(Launcher::PathFromUtf8(argv[argc - 1]), "converted");
+        const auto output = Launcher::PathFromUtf8(argv[argc - 1]);
+        Write(output, "converted");
+        for (int index = 1; index < argc - 2; ++index) {
+            if (std::string(argv[index]) == "--registry") Write(output.parent_path() / (output.stem().string() + ".registry.json"), "[]");
+        }
         return 0;
     }
     const auto root = std::filesystem::temp_directory_path() /
@@ -49,6 +53,8 @@ int main(int argc, char* argv[]) {
             Launcher::PathFromUtf8(argv[0]), libraries, false, windowsTarget});
         Require(game.Name == "Source_Game", "installation name was not sanitized");
         Require(std::filesystem::is_regular_file(game.Executable), "converted executable is missing");
+        Require(std::filesystem::is_regular_file(game.Executable.parent_path() / "game.registry.json"),
+                "compatibility registry is missing");
         Require(std::filesystem::is_regular_file(game.Executable.parent_path() / "app0" / "data" / "asset.bin"),
                 "game resource was not copied");
         Require(!std::filesystem::exists(game.Executable.parent_path() / "app0" / "eboot.bin"),

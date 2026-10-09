@@ -432,6 +432,7 @@ Game InstallGame(const InstallRequest& request) {
             arguments.emplace_back("--windows-gui");
         }
         if (request.ToIntel) arguments.emplace_back("--to-intel");
+        arguments.emplace_back("--registry");
         arguments.push_back(sourceExecutable);
         arguments.push_back(output);
         std::string relinkerOutput;

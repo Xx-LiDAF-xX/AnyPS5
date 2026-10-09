@@ -23,7 +23,8 @@ Enable **Intel compatibility** on an Intel host or when AMD-only instructions mu
 1. Copies game resources into a private staging directory, excluding the original executable and bundled module directories.
 2. Copies the built AnyPS5 PRX libraries and required MinGW runtime DLLs on Windows.
 3. Runs the relinker and converts bundled modules.
-4. Publishes the completed installation atomically into the game library.
+4. Writes `game.registry.json` for repeatable import compatibility checks.
+5. Publishes the completed installation atomically into the game library.
 
 A failed installation removes its staging directory and leaves existing games unchanged. Installing another dump whose directory has the same name is rejected rather than overwritten.
 
@@ -32,5 +33,7 @@ A failed installation removes its staging directory and leaves existing games un
 Select an entry under **Installed games** and press **Run selected**. The game starts with its installation directory as its working directory. Use **Refresh** after changing the library path or its contents outside the launcher.
 
 On Windows, the launcher observes the first 1.5 seconds of startup. If the executable exits during that interval, the launcher reports its NT status instead of reporting that the game started successfully.
+
+Use the [compatibility evaluator](COMPATIBILITY_EVALUATION.md) to audit an installed game's imports, run project tests and perform a bounded startup probe with redacted diagnostics.
 
 Linux currently uses drag-and-drop or path paste for selecting an executable. The launcher shows at most six installed games in this first version.
