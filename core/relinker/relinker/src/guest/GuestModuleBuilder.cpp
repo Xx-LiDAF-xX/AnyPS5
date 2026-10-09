@@ -3,7 +3,9 @@
 #include <codegen/IAmd64OnlyConverter.hpp>
 #include <io/FileReader.hpp>
 #include <io/BufferUtils.hpp>
+#include <relinker/parsing/SelfExtractor.hpp>
 #include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -46,13 +48,23 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     if (hasPrx) directories.push_back(prx);
     std::vector<std::filesystem::path> paths;
     std::set<std::string> unmatchedExclusions = excludedModules;
+    const auto isModuleFilename = [](const std::filesystem::path& path) {
+        auto extension = path.extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(), [](const unsigned char value) { return static_cast<char>(std::tolower(value)); });
+        return extension == ".prx" || extension == ".sprx" || extension == ".elf";
+    };
     const auto isElf = [](const std::filesystem::path& path) {
         std::ifstream stream(path, std::ios::binary);
         if (!stream) throw Domain::RelinkerException("Cannot read guest candidate: " + path.string());
         char magic[4]{};
         stream.read(magic, 4);
         if (stream.bad()) throw Domain::RelinkerException("Cannot read guest candidate magic: " + path.string());
-        return stream.gcount() == 4 && static_cast<unsigned char>(magic[0]) == 0x7f && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F';
+        if (stream.gcount() != 4) return false;
+        const auto value = static_cast<std::uint32_t>(static_cast<unsigned char>(magic[0])) |
+            (static_cast<std::uint32_t>(static_cast<unsigned char>(magic[1])) << 8) |
+            (static_cast<std::uint32_t>(static_cast<unsigned char>(magic[2])) << 16) |
+            (static_cast<std::uint32_t>(static_cast<unsigned char>(magic[3])) << 24);
+        return value == 0x464c457f || value == 0x1d3d154f || value == 0xeef51454;
     };
     for (const auto& directory : directories) {
         if (!std::filesystem::is_directory(directory)) throw Domain::RelinkerException("Guest module path is not a directory: " + directory.string());
@@ -63,6 +75,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
                 continue;
             }
             if (!entry.is_regular_file()) continue;
+            if (!isModuleFilename(entry.path())) continue;
             if (isElf(entry.path())) paths.push_back(entry.path());
         }
     }
@@ -95,7 +108,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     std::set<std::string> outputNames;
     Io::FileReader reader;
     for (const auto& path : paths) {
-        auto image = GuestImageReader().Read(path, reader.Read(path.string()));
+        auto image = GuestImageReader().Read(path, SelfExtractor().Extract(reader.Read(path.string())));
         if (image.OutputName.find_first_of("$\r\n") != std::string::npos) throw Domain::RelinkerException("Unsupported guest filename: " + image.OutputName);
         std::string folded = image.OutputName;
         if (windows) {

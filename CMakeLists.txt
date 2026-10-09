@@ -30,6 +30,17 @@ add_compile_definitions(APS5_ENABLE_TIMING_LOG=$<BOOL:${APS5_ENABLE_TIMING_LOG}>
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    add_compile_options(
+        "$<$<CONFIG:Release>:-ffile-prefix-map=${CMAKE_SOURCE_DIR}=.>"
+        "$<$<CONFIG:Release>:-fmacro-prefix-map=${CMAKE_SOURCE_DIR}=.>"
+        "$<$<CONFIG:Release>:-fdebug-prefix-map=${CMAKE_SOURCE_DIR}=.>"
+        "$<$<CONFIG:Release>:-ffile-prefix-map=${CMAKE_BINARY_DIR}=.>"
+        "$<$<CONFIG:Release>:-fmacro-prefix-map=${CMAKE_BINARY_DIR}=.>"
+        "$<$<CONFIG:Release>:-fdebug-prefix-map=${CMAKE_BINARY_DIR}=.>"
+    )
+endif()
+
 if(NOT APPLE)
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static -static-libgcc -static-libstdc++")
 endif()
@@ -94,3 +105,4 @@ add_subdirectory(core/Decoder/Jpeg)
 add_subdirectory(core/Decoder/Png)
 add_subdirectory(core/libs)
 add_subdirectory(core/relinker)
+add_subdirectory(core/launcher)

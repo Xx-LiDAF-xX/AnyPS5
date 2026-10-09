@@ -72,6 +72,8 @@ def main():
                 (provider / "provider.prx").write_bytes(module_with_symbol(True))
                 (prx / "consumer.prx").write_bytes(module_with_symbol(False))
                 (prx / "ignored.txt").write_text("not ELF")
+                (prx / "provider.prx.esbak").write_bytes(module_with_symbol(True))
+                (prx / "provider.bin").write_bytes(module_with_symbol(True))
                 (prx / "old.prx.guest.prx").write_bytes(guest_fixture(PLAIN_SITE))
                 result, output = convert(case, windows)
                 assert result.returncode == 0, (result.stdout, result.stderr)

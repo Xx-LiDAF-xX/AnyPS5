@@ -2,7 +2,7 @@
 
 ## Input and conversion
 
-Use a clean ELF executable. Place its bundled ELF modules in `sce_module/`, `sce_modules/`, or `prx/` beside the input executable. `prx/` can coexist with either `sce_module/` or `sce_modules/`. Both `sce_module/` and `sce_modules/` present, or all three absent, is an error.
+Use a clean ELF executable or an already-decrypted, uncompressed SELF wrapper. The input filename may end in `.bin` or `.elf`; a typical main executable is named `eboot.bin`. Place its bundled ELF or plaintext SELF modules in `sce_module/`, `sce_modules/`, or `prx/` beside the input executable. `prx/` can coexist with either `sce_module/` or `sce_modules/`. Both `sce_module/` and `sce_modules/` present, or all three absent, is an error. Encrypted or compressed SELF segments are unsupported.
 
 ```text
 source/
@@ -12,19 +12,19 @@ source/
 ```
 
 ```text
-relinker [options] <input.elf> <output>
+relinker [options] <input.bin|input.elf> <output>
 ```
 
 Linux output:
 
 ```sh
-relinker source/input.elf app.elf
+relinker source/eboot.bin app.elf
 ```
 
 Windows output:
 
 ```sh
-relinker --windows source/input.elf app.exe
+relinker --windows source/eboot.bin app.exe
 ```
 
 Add `--to-intel` for Intel hosts. The output format defaults to Linux ELF regardless of the filename; `.exe` alone does not select Windows.
@@ -70,7 +70,7 @@ app0/
 
 Use `sce_modules/` or `prx/` instead of `sce_module/` if that is the input directory name. Relinker preserves each module's directory under `app0/` and prints its exact path. Place app resources in `app0/` separately. Copy the built system libraries from `build/core/libs/libs/*.prx` into `libs/`; use libraries built for the target OS. A custom `--rpath` changes the system library location.
 
-Use the generated files printed as `Guest module:` for bundled title modules. `libs/` is for AnyPS5 system libraries, not the original PS5 `.prx` files. Placing an original PS5 module in `libs/` on Windows makes Windows try to load it as a DLL and can fail with error 193 (not a valid Win32 application).
+Use the generated files printed as `Guest module:` for bundled title modules. `libs/` is for AnyPS5 system libraries, not the original PS5 `.prx` files. Windows builds using MinGW also require `libgcc_s_seh-1.dll`, `libstdc++-6.dll`, and `libwinpthread-1.dll` in `libs/`; `launcher_bundle` includes them automatically. Placing an original PS5 module in `libs/` on Windows makes Windows try to load it as a DLL and can fail with error 193 (not a valid Win32 application).
 
 On Windows, direct memory (`sceKernelAllocateDirectMemory`, up to 13824 MiB per title) is committed in full when the title allocates it, not when its pages are first used. The system commit limit (installed memory plus page file size, the second value of Committed in Task Manager) must cover it together with all other committed memory. Otherwise the allocation throws `create direct memory backing of 0x<n> bytes (<m> MiB)` with the Windows error; enlarge the page file or close other applications.
 

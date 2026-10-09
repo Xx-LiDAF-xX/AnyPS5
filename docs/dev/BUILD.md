@@ -44,6 +44,14 @@ library change without it therefore tests the previous binaries and can show no 
 
 [Relinker usage and runtime layout](../user/USAGE.md).
 
+To build a ready-to-run launcher bundle containing the GUI, relinker and patched PRX libraries:
+
+```bash
+cmake --build build --target launcher_bundle
+```
+
+The output is placed in `build/launcher/`. See the [launcher guide](../user/LAUNCHER.md).
+
 ## CMake flags
 
 Project switches accept `ON` or `OFF`:

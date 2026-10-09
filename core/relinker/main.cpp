@@ -10,6 +10,7 @@
 #include <elfpatcher/windows/WindowsElfPatcher.hpp>
 #include <io/ByteWriter.hpp>
 #include <relinker/parsing/ElfReader.hpp>
+#include <relinker/parsing/SelfExtractor.hpp>
 #include <relinker/analysis/ValidationPolicy.hpp>
 #include <relinker/analysis/SyscallScanner.hpp>
 #include <relinker/analysis/CallSiteResolver.hpp>
@@ -43,7 +44,7 @@ int main(const int argc, char* argv[]) {
         Io::FileReader fileReader;
         Io::FileWriter fileWriter;
 
-        auto sourceBytes = fileReader.Read(args.inputPath);
+        auto sourceBytes = Relinker::SelfExtractor().Extract(fileReader.Read(args.inputPath));
         const std::string absPath = std::filesystem::absolute(args.outputPath).string();
 
         std::vector<Codegen::TrampolineSite> trampolines;

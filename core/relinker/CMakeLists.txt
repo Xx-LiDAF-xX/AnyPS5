@@ -48,6 +48,7 @@ add_executable(relinker
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/ReciprocalOperands.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/x86/ReciprocalLowering.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/parsing/ElfReader.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/parsing/SelfExtractor.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/analysis/SyscallScanner.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/analysis/CallSiteResolver.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/analysis/CodeInstructionCollector.cpp
@@ -125,6 +126,16 @@ endif()
 
 
 if(BUILD_TESTING)
+    add_test_executable(self_extractor_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/SelfExtractorTests.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/parsing/SelfExtractor.cpp
+    )
+    target_include_directories(self_extractor_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/domain/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/include
+    )
+    add_test(NAME self_extractor COMMAND self_extractor_tests)
+
     add_test_executable(autorun_exit_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/cli/tests/AutorunExitTests.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/Autorun.cpp)

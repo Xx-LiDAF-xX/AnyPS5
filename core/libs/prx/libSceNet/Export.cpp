@@ -1204,5 +1204,6 @@ int APS5_VABI sceNetResolverStartNtoaMultipleRecords() {
 
 extern const std::uint8_t in6addr_any_nid_postfix[16] = {};
 extern const std::uint8_t in6addr_loopback_nid_postfix[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+extern const std::uint8_t sce_net_in6addr_linklocal_allnodes_nid_postfix[16] = {0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
 
 }

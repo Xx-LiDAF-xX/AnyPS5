@@ -1,0 +1,22 @@
+if(NOT DEFINED SOURCE OR NOT DEFINED DESTINATION)
+    message(FATAL_ERROR "SOURCE and DESTINATION are required")
+endif()
+
+file(GLOB libraries "${SOURCE}/*.prx")
+if(NOT libraries)
+    message(FATAL_ERROR "No patched PRX libraries were built")
+endif()
+
+file(REMOVE_RECURSE "${DESTINATION}")
+file(MAKE_DIRECTORY "${DESTINATION}")
+file(COPY ${libraries} DESTINATION "${DESTINATION}")
+
+if(DEFINED RUNTIME_DIRECTORY AND NOT RUNTIME_DIRECTORY STREQUAL "")
+    foreach(name libgcc_s_seh-1.dll libstdc++-6.dll libwinpthread-1.dll)
+        set(path "${RUNTIME_DIRECTORY}/${name}")
+        if(NOT EXISTS "${path}")
+            message(FATAL_ERROR "Required MinGW runtime DLL is missing: ${name}")
+        endif()
+        file(COPY "${path}" DESTINATION "${DESTINATION}")
+    endforeach()
+endif()
