@@ -275,6 +275,8 @@ def reject(options, directory):
         result = run([*base, "--output", alias, "--emit-llvm", directory / "ALIAS.O"], success=False)
         if not result.stderr.strip() or alias.exists() or list(directory.glob("*.tmp")):
             raise AssertionError("Aliased outputs must fail before publishing any output")
+    else:
+        print("Skipped aliased-output rejection: the filesystem is case-sensitive")
     source.write_bytes(elf(b"\x48\x89\xf8\xc3"))
     run([*base, "--args", "0"], success=False)
     print(f"Rejected {len(invalid_inputs)} invalid or unsupported inputs and invalid CLI/output requests")
