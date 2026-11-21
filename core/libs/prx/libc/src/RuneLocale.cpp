@@ -1,4 +1,7 @@
+#include "prx/libc/include/Api.hpp"
+#include "prx/libc/include/General.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -108,6 +111,7 @@ int APS5_VABI iswpunct_nid_postfix(std::uint32_t c) { return GuestRune::Is(c, Gu
 int APS5_VABI iswspace_nid_postfix(std::uint32_t c) { return GuestRune::Is(c, GuestRune::Space); }
 int APS5_VABI iswupper_nid_postfix(std::uint32_t c) { return GuestRune::Is(c, GuestRune::Upper); }
 int APS5_VABI iswxdigit_nid_postfix(std::uint32_t c) { return GuestRune::Is(c, GuestRune::Hex); }
+int APS5_VABI iswascii_nid_postfix(std::uint32_t c) { return (c & ~0x7Fu) == 0; }
 int APS5_VABI iswctype_nid_postfix(std::uint32_t c, std::uint64_t mask) { return GuestRune::Is(c, mask); }
 
 int APS5_VABI _Iswctype_nid_postfix(std::uint32_t c, std::uint64_t type) {
@@ -116,7 +120,8 @@ int APS5_VABI _Iswctype_nid_postfix(std::uint32_t c, std::uint64_t type) {
         GuestRune::Graph, GuestRune::Lower, GuestRune::Print, GuestRune::Punct,
         GuestRune::Space, GuestRune::Upper, GuestRune::Hex, GuestRune::Blank,
     };
-    if (type == 0 || type > std::size(masks)) throw std::invalid_argument("_Iswctype: unknown class " + std::to_string(type));
+    if (type == 0 || type == std::size(masks) + 1) return 0;
+    if (type > std::size(masks)) throw std::invalid_argument("_Iswctype: unknown class " + std::to_string(type));
     return GuestRune::Is(c, masks[type - 1]);
 }
 
@@ -132,8 +137,10 @@ std::uint64_t APS5_VABI wctype_nid_postfix(const char* property) {
         {"ideogram", 0x80000}, {"special", 0x100000}, {"phonogram", 0x200000},
         {"number", GuestRune::Number}, {"rune", 0xffffff00},
     };
+    std::string name;
+    if (CopyGuestString_nid_no_patch(property, 10, name) != 0) return 0;
     for (const auto& entry : properties) {
-        if (std::strcmp(property, entry.name) == 0) return entry.mask;
+        if (name == entry.name) return entry.mask;
     }
     return 0;
 }
@@ -147,20 +154,31 @@ std::uint32_t APS5_VABI towupper_nid_postfix(std::uint32_t c) {
 }
 
 std::uint32_t APS5_VABI btowc_nid_postfix(int c) {
-    return c == -1 ? GuestRune::Weof : static_cast<unsigned char>(c);
+    const auto byte = static_cast<unsigned char>(c);
+    if (c == -1) return GuestRune::Weof;
+    if (byte < 0x80) return byte;
+    if (byte < 0xc0 || byte >= 0xf0) errno = 86;
+    return GuestRune::Weof;
 }
 
 int APS5_VABI wctob_nid_postfix(std::uint32_t c) {
-    return c < 256 ? static_cast<int>(c) : -1;
+    const auto unit = static_cast<std::uint16_t>(c);
+    return unit < 0x80 ? static_cast<int>(unit) : -1;
 }
 
-std::uint32_t APS5_VABI _Towctrans_nid_postfix(std::uint32_t c, std::uint64_t desc);
-const short* APS5_VABI _Getptolower_nid_postfix();
-const short* APS5_VABI _Getptoupper_nid_postfix();
+std::uint32_t APS5_VABI _Btowc_nid_postfix(int c) {
+    return btowc_nid_postfix(c);
+}
+
+int APS5_VABI _Wctob_nid_postfix(std::uint32_t c) {
+    return wctob_nid_postfix(c);
+}
 
 std::uint64_t APS5_VABI wctrans_nid_postfix(const char* property) {
-    if (std::strcmp(property, "tolower") == 0) return 1;
-    if (std::strcmp(property, "toupper") == 0) return 2;
+    std::string name;
+    if (CopyGuestString_nid_no_patch(property, 8, name) != 0) return 0;
+    if (name == "tolower") return 1;
+    if (name == "toupper") return 2;
     return 0;
 }
 

@@ -1,16 +1,13 @@
+#include "prx/libSceIme/include/Api.hpp"
 #include "SceTypes.hpp"
 #include "prx/libSceIme/include/ImeFilterText.hpp"
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
 #include <string>
 #include <vector>
-
-extern "C" {
-int APS5_VABI sceImeFilterText(char16_t* dst, int32_t* out_length, uint32_t capacity,
-                               const ime_filter::FilterParam* param, const char16_t* src, uint32_t src_length);
-}
 
 namespace {
 
@@ -65,6 +62,7 @@ void CheckArguments() {
     Require(Run(0, 5, 16, {u'a'}).code == kInvalidParam, "type 5");
     Require(Run(0, 0xff, 16, {u'a'}).code == kInvalidParam, "type 0xff");
     Require(Run(0, 0x104, 16, {u'a'}).code == kInvalidParam, "type 0x104");
+    Require(Run(0, 0x200, 16, {u'a'}).code == kInvalidParam, "type 0x200");
 }
 
 void CheckSimpleTypes() {
@@ -96,6 +94,24 @@ void CheckBounds() {
     Expect(Run(0, 1, 16, {0x41, 0x42, 0x43}, 0), {}, "empty source");
 }
 
+void CheckFilterTextTerminator() {
+    Require(sceImeCheckFilterText(nullptr, 0) == -3, "null filter text");
+
+    char16_t shortText[]{u'a', 0};
+    Require(sceImeCheckFilterText(shortText, 0) == 0, "terminated filter text");
+
+    std::vector<char16_t> text(0x99, u'x');
+    text[0x97] = 0;
+    Require(sceImeCheckFilterText(text.data(), 0) == 0, "terminator at the last scanned code unit");
+    Require(text[0x98] == u'x', "valid filter text is unchanged");
+
+    std::fill(text.begin(), text.end(), u'x');
+    Require(sceImeCheckFilterText(text.data(), 0) == -2, "unterminated filter text without repair");
+    Require(text[0x98] == u'x', "validation without repair does not write a terminator");
+    Require(sceImeCheckFilterText(text.data(), 1) == 0, "unterminated filter text with repair");
+    Require(text[0x98] == 0, "repair terminates the text after the scanned range");
+}
+
 }
 
 int main() {
@@ -104,5 +120,6 @@ int main() {
     CheckLatinType();
     CheckClassifiedType();
     CheckBounds();
+    CheckFilterTextTerminator();
     return 0;
 }

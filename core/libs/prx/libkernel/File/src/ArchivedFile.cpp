@@ -6,6 +6,7 @@
 
 #include <cerrno>
 #include <string>
+#include <system_error>
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -35,6 +36,7 @@ void FillNode(const AppArchiveNode& node, FileStat* sb) {
     sb->st_nlink = node.Directory ? 2 : 1;
     sb->st_size = static_cast<std::int64_t>(node.Size);
     sb->st_blocks = static_cast<std::int64_t>((node.Size + 511) / 512);
+    if (node.Directory) sb->st_blksize = 0x10000;
 }
 
 }
@@ -55,12 +57,6 @@ std::optional<int> OpenArchivedFile(const std::filesystem::path& native, int fla
     return fd;
 }
 
-void RefuseMergedDirectory(const std::filesystem::path& native) {
-    if (!AppArchiveHasDirectory_nid_no_patch(native)) return;
-    std::error_code error;
-    if (std::filesystem::is_directory(native, error)) NotImplemented_nid_no_patch(("opening " + native.string() + " merged with app0.zar").c_str());
-}
-
 bool IsArchivedFile(int fd) {
     return AppArchiveDescriptor_nid_no_patch(fd, nullptr, nullptr);
 }
@@ -78,7 +74,12 @@ std::optional<std::int64_t> ReadArchivedIovecs(int fd, const void* iov, int iovc
     if (!IsArchivedFile(fd)) return std::nullopt;
     if (offset != nullptr && *offset < 0) return -EINVAL;
     std::uint64_t read = 0;
-    if (!AppArchiveDescriptorRead_nid_no_patch(fd, static_cast<const AppArchiveBuffer*>(iov), iovcnt, offset, &read)) return std::nullopt;
+    try {
+        if (!AppArchiveDescriptorRead_nid_no_patch(fd, static_cast<const AppArchiveBuffer*>(iov), iovcnt, offset, &read)) return std::nullopt;
+    } catch (const std::system_error& error) {
+        if (error.code() == std::errc::bad_address) return -EFAULT;
+        throw;
+    }
     return static_cast<std::int64_t>(read);
 }
 

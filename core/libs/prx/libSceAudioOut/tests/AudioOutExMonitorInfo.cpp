@@ -1,14 +1,12 @@
+#include "prx/libSceAudioOut/include/AudioOut.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 
 #include <array>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-
-extern "C" {
-int APS5_VABI sceAudioOutExGetMonitorInfo(int, int, void*, std::uint32_t);
-}
 
 static void Require(bool value, const char* message) {
     if (value) return;
@@ -52,5 +50,8 @@ int main() {
         Require(sceAudioOutExGetMonitorInfo(1, 0, nullptr, size) == static_cast<int>(0x80260003), "type checked before pointer");
         for (const auto value : buffer) Require(value == untouched, "failure preserves output");
     }
+    errno = 71;
+    Require(sceAudioOutExGetMonitorInfo(0, 0, reinterpret_cast<void*>(0x10), titleSize) == invalidPointer, "an unwritable output is rejected");
+    Require(errno == 71, "errno is preserved for an unwritable output");
     return 0;
 }

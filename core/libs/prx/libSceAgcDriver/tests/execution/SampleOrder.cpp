@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
@@ -69,6 +70,12 @@ using AgcDriver::Graphics::SampleOrder;
 using AgcDriver::Graphics::SampleOrderMethod;
 using AgcDriver::Graphics::SampleOrderPass;
 using AgcDriver::Graphics::SampleOrderTarget;
+
+void RecordSampleOrderOn(const Context& context, VkCommandBuffer commands, const SampleOrderPass& pass, std::span<const SampleOrderTarget> targets, bool toHost, std::vector<std::shared_ptr<void>>& kept) {
+    AgcDriver::Graphics::CommandState recording;
+    recording.Begin(commands);
+    AgcDriver::Graphics::RecordSampleOrder(context, recording, pass, targets, toHost, kept);
+}
 using ShaderRecompiler::PixelInput;
 using ShaderRecompiler::PixelInputBit;
 using ShaderRecompiler::ShaderStage;
@@ -258,7 +265,7 @@ public:
         context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, layout, stages, 0u, pushBytes, push);
     }
     void Dispatch(VkCommandBuffer commands, const void* push, VkExtent2D extent) const {
-        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        context.BindComputePipeline(commands, pipeline);
         Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, push);
         context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(commands, (extent.width + 7u) / 8u, (extent.height + 7u) / 8u, 1u);
     }
@@ -393,7 +400,9 @@ public:
         begin.framebuffer = framebuffer;
         begin.renderArea = {{0, 0}, extent};
         context.Function<PFN_vkCmdBeginRenderPass>("vkCmdBeginRenderPass")(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
-        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        AgcDriver::Graphics::CommandState state;
+        state.Begin(commands, false);
+        state.BindPipeline(context, pipeline, 0);
         const std::array<std::uint32_t, 2> push{extent.width, samples};
         program->Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, push.data());
         context.Function<PFN_vkCmdDraw>("vkCmdDraw")(commands, 3u, 1u, 0u, 0u);
@@ -536,14 +545,14 @@ bool ColorSwaps(const Context& context, VkFormat format, std::uint32_t elementBy
     });
     Require(Masked(ReadValues(values, count), elementBytes) == before, name + ": the stored samples did not read back");
     Submit(context, [&](VkCommandBuffer commands) {
-        AgcDriver::Graphics::RecordSampleOrder(context, commands, pass, std::span(&target, 1u), true, kept);
+        RecordSampleOrderOn(context, commands, pass, std::span(&target, 1u), true, kept);
         FullBarrier(context, commands);
         texels.Dispatch(commands, load.data(), SwapExtent);
         HostBarrier(context, commands);
     });
     CheckOrdered(before, Masked(ReadValues(values, count), elementBytes), SwapExtent, SwapRegion, samples, order, true, name + " put in the host's order");
     Submit(context, [&](VkCommandBuffer commands) {
-        AgcDriver::Graphics::RecordSampleOrder(context, commands, pass, std::span(&target, 1u), false, kept);
+        RecordSampleOrderOn(context, commands, pass, std::span(&target, 1u), false, kept);
         FullBarrier(context, commands);
         texels.Dispatch(commands, load.data(), SwapExtent);
         HostBarrier(context, commands);
@@ -624,14 +633,14 @@ bool DepthSwaps(const Context& context, VkFormat format, std::uint32_t samples, 
         Require(depthHeld && (!stencil || before[index][1] == filled[index][1]), name + ": the filled sample " + std::to_string(index) + " did not read back");
     }
     Submit(context, [&](VkCommandBuffer commands) {
-        AgcDriver::Graphics::RecordSampleOrder(context, commands, pass, std::span(&target, 1u), true, kept);
+        RecordSampleOrderOn(context, commands, pass, std::span(&target, 1u), true, kept);
         FullBarrier(context, commands);
         read.Dispatch(commands, push.data(), SwapExtent);
         HostBarrier(context, commands);
     });
     CheckOrdered(before, ReadValues(values, count), SwapExtent, SwapRegion, samples, order, true, name + " put in the host's order");
     Submit(context, [&](VkCommandBuffer commands) {
-        AgcDriver::Graphics::RecordSampleOrder(context, commands, pass, std::span(&target, 1u), false, kept);
+        RecordSampleOrderOn(context, commands, pass, std::span(&target, 1u), false, kept);
         FullBarrier(context, commands);
         read.Dispatch(commands, push.data(), SwapExtent);
         HostBarrier(context, commands);
@@ -1122,6 +1131,22 @@ Samples ReadTarget(const Context& context, VkImageView view, bool color, std::ui
     return ReadValues(values, count);
 }
 
+Samples ReadDepth(const Context& context, const AgcDriver::Graphics::DepthTarget& depth, std::uint32_t samples) {
+    const auto target = AgcDriver::Graphics::DepthSurfaceOrderTarget(context, depth);
+    const VkImageAspectFlags aspects = VK_IMAGE_ASPECT_DEPTH_BIT | (AgcDriver::Graphics::HasStencil(target.format) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+    Image copy(context, target.format, samples, ReferenceExtent, DepthUsage, 0u);
+    VkImageCopy region{};
+    region.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0u, 0u, 1u};
+    region.dstSubresource = region.srcSubresource;
+    region.extent = {ReferenceExtent.width, ReferenceExtent.height, 1u};
+    Submit(context, [&](VkCommandBuffer commands) {
+        copy.ToGeneral(commands, aspects);
+        FullBarrier(context, commands);
+        context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, target.image, VK_IMAGE_LAYOUT_GENERAL, copy.Handle(), VK_IMAGE_LAYOUT_GENERAL, 1u, &region);
+    });
+    return ReadTarget(context, copy.View(target.format, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_USAGE_SAMPLED_BIT), false, samples);
+}
+
 Rendered RenderCheckerboard(AgcDriver::VulkanDevice& device, const Context& context, std::uint32_t samples, std::size_t run, const std::optional<std::array<std::uint8_t, 32>>& locations) {
     AgcDriver::Graphics::ColorTarget color{};
     color.extent = ReferenceExtent;
@@ -1169,7 +1194,7 @@ Rendered RenderCheckerboard(AgcDriver::VulkanDevice& device, const Context& cont
     Settle(device);
     Rendered rendered;
     rendered.color = ReadTarget(context, AgcDriver::Graphics::MultisampleTargetView(context, color), true, samples);
-    rendered.depth = ReadTarget(context, AgcDriver::Graphics::DepthSurfaceOrderTarget(context, depth).view, false, samples);
+    rendered.depth = ReadDepth(context, depth, samples);
     return rendered;
 }
 
@@ -1348,7 +1373,7 @@ void CheckRecipeDepth(AgcDriver::VulkanDevice& device, const Context& context, c
         std::printf("%s: builds no recipe, since a draw that reorders its samples is built in full each time, with its sample swaps\n", what.c_str());
         return;
     }
-    const auto read = [&] { return ReadTarget(context, AgcDriver::Graphics::DepthSurfaceOrderTarget(context, depth).view, false, samples); };
+    const auto read = [&] { return ReadDepth(context, depth, samples); };
     Samples recorded;
     slopes.beforeReplay = [&] {
         Settle(device);
@@ -1450,13 +1475,13 @@ int Bench(AgcDriver::VulkanDevice& device, VkExtent2D extent, std::uint32_t samp
                     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, query);
                 };
                 stamp(0u);
-                AgcDriver::Graphics::RecordSampleOrder(context, commands, pass, std::span(targets).subspan(1u), true, kept);
+                RecordSampleOrderOn(context, commands, pass, std::span(targets).subspan(1u), true, kept);
                 stamp(1u);
-                AgcDriver::Graphics::RecordSampleOrder(context, commands, pass, std::span(targets).subspan(1u), false, kept);
+                RecordSampleOrderOn(context, commands, pass, std::span(targets).subspan(1u), false, kept);
                 stamp(2u);
-                AgcDriver::Graphics::RecordSampleOrder(context, commands, pass, targets, true, kept);
+                RecordSampleOrderOn(context, commands, pass, targets, true, kept);
                 stamp(3u);
-                AgcDriver::Graphics::RecordSampleOrder(context, commands, pass, targets, false, kept);
+                RecordSampleOrderOn(context, commands, pass, targets, false, kept);
                 stamp(4u);
             });
             std::array<std::uint64_t, 5> ticks{};

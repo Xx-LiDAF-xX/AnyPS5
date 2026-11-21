@@ -1,5 +1,7 @@
+#include "prx/libc/include/Api.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <array>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -7,43 +9,19 @@
 #include <limits>
 #include <stdexcept>
 #include <thread>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
-extern "C" {
-int* APS5_VABI __error_nid_postfix();
-void* APS5_VABI sceLibcMspaceCreate_nid_postfix(const char*, void*, std::size_t, unsigned);
-int APS5_VABI sceLibcMspaceDestroy_nid_postfix(void*);
-void* APS5_VABI sceLibcMspaceMalloc_nid_postfix(void*, std::size_t);
-void* APS5_VABI sceLibcMspaceCalloc_nid_postfix(void*, std::size_t, std::size_t);
-void* APS5_VABI sceLibcMspaceRealloc_nid_postfix(void*, void*, std::size_t);
-void APS5_VABI sceLibcMspaceFree_nid_postfix(void*, void*);
-int APS5_VABI sceLibcMspacePosixMemalign_nid_postfix(void*, void**, std::size_t, std::size_t);
-std::size_t APS5_VABI sceLibcMspaceMallocUsableSize_nid_postfix(const void*);
-void* APS5_VABI sceLibcMspaceMemalign_nid_postfix(void*, std::size_t, std::size_t);
-void* APS5_VABI sceLibcMspaceAlignedAlloc_nid_postfix(void*, std::size_t, std::size_t);
-void* APS5_VABI sceLibcMspaceReallocalign_nid_postfix(void*, void*, std::size_t, std::size_t);
-int APS5_VABI sceLibcMspaceMallocStats_nid_postfix(void*, void*);
-int APS5_VABI sceLibcMspaceMallocStatsFast_nid_postfix(void*, void*);
-void* APS5_VABI sceLibcPafMspaceCreate_nid_postfix(const char*, void*, std::size_t, unsigned, const void*);
-int APS5_VABI sceLibcPafMspaceDestroy_nid_postfix(void*);
-void* APS5_VABI sceLibcPafMspaceMalloc_nid_postfix(void*, std::size_t, const void*);
-void APS5_VABI sceLibcPafMspaceFree_nid_postfix(void*, void*, const void*);
-void* APS5_VABI sceLibcPafMspaceCalloc_nid_postfix(void*, std::size_t, std::size_t, const void*);
-void* APS5_VABI sceLibcPafMspaceRealloc_nid_postfix(void*, void*, std::size_t, const void*);
-void* APS5_VABI sceLibcPafMspaceReallocalign_nid_postfix(void*, void*, std::size_t, std::size_t, const void*);
-void* APS5_VABI sceLibcPafMspaceMemalign_nid_postfix(void*, std::size_t, std::size_t, const void*);
-int APS5_VABI sceLibcPafMspacePosixMemalign_nid_postfix(void*, void**, std::size_t, std::size_t, const void*);
-int APS5_VABI sceLibcPafMspaceMallocStats_nid_postfix(void*, void*);
-int APS5_VABI sceLibcPafMspaceMallocStatsFast_nid_postfix(void*, void*);
-}
-struct MallocManagedSize {
-    std::uint16_t size;
-    std::uint16_t version;
-    std::uint32_t reserved;
-    std::size_t maxSystemSize;
-    std::size_t currentSystemSize;
-    std::size_t maxInuseSize;
-    std::size_t currentInuseSize;
-};
 static void Require(bool value) {
     if (!value) { std::fputs("Mspace check failed\n", stderr); std::abort(); }
 }
@@ -56,9 +34,11 @@ static void CheckPaf() {
     Require(rejected);
     void* arena = sceLibcPafMspaceCreate_nid_postfix("paf", storage.data(), storage.size(), 0, nullptr);
     Require(arena == storage.data());
+    Require(sceLibcMspaceIsHeapEmpty_nid_postfix(arena) == 1 && sceLibcPafMspaceIsHeapEmpty_nid_postfix(arena) == 1);
     const int owner = 0;
     auto* block = static_cast<unsigned char*>(sceLibcPafMspaceMalloc_nid_postfix(arena, 40, &owner));
     Require(block != nullptr && sceLibcMspaceMallocUsableSize_nid_postfix(block) >= 40);
+    Require(sceLibcMspaceIsHeapEmpty_nid_postfix(arena) == 0 && sceLibcPafMspaceIsHeapEmpty_nid_postfix(arena) == 0);
     std::memset(block, 0x5a, 40);
     auto* zeroed = static_cast<unsigned char*>(sceLibcPafMspaceCalloc_nid_postfix(arena, 4, 8, arena));
     Require(zeroed != nullptr && zeroed[0] == 0 && zeroed[31] == 0);
@@ -87,8 +67,12 @@ static void CheckPaf() {
     sceLibcPafMspaceFree_nid_postfix(arena, aligned, &owner);
     sceLibcPafMspaceFree_nid_postfix(arena, posixAligned, &owner);
     sceLibcPafMspaceFree_nid_postfix(arena, nullptr, &owner);
+
+    Require(sceLibcMspaceIsHeapEmpty_nid_postfix(arena) == 1 && sceLibcPafMspaceIsHeapEmpty_nid_postfix(arena) == 1);
     Require(sceLibcPafMspaceDestroy_nid_postfix(arena) == 0);
     Require(sceLibcPafMspaceDestroy_nid_postfix(arena) == -1);
+    Require(sceLibcMspaceIsHeapEmpty_nid_postfix(arena) == 0);
+    Require(sceLibcMspaceIsHeapEmpty_nid_postfix(nullptr) == 0);
 }
 static void CheckAlignment() {
     alignas(32) static std::array<unsigned char, 65536 + 16> storage{};
@@ -161,7 +145,55 @@ static void CheckMovedBlockKeepsUsableBytes() {
     Require(realigned != nullptr && realigned != other && kept(realigned, otherUsable));
     Require(sceLibcMspaceDestroy_nid_postfix(arena) == 0);
 }
+static void CheckUnwritableResult() {
+#ifdef _WIN32
+    const std::size_t pageSize = 4096;
+    void* page = VirtualAlloc(nullptr, pageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    Require(page != nullptr);
+#else
+    const std::size_t pageSize = static_cast<std::size_t>(sysconf(_SC_PAGESIZE) > 0 ? sysconf(_SC_PAGESIZE) : 4096);
+    void* page = mmap(nullptr, pageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    Require(page != MAP_FAILED);
+#endif
+    std::memset(page, 0, pageSize);
+#ifdef _WIN32
+    DWORD oldProtect = 0;
+    Require(VirtualProtect(page, pageSize, PAGE_READONLY, &oldProtect) != 0);
+#else
+    Require(mprotect(page, pageSize, PROT_READ) == 0);
+#endif
+    auto* readOnlyResult = static_cast<void**>(page);
+    auto* unmappedResult = reinterpret_cast<void**>(std::uintptr_t{0x10});
+    auto rejectsKeepingErrno = [](auto call) {
+        errno = 71;
+        bool caught = false;
+        try { call(); }
+        catch (const std::invalid_argument&) { caught = true; }
+        return caught && errno == 71;
+    };
+    alignas(16) static std::array<unsigned char, 16384> storage{};
+    void* arena = sceLibcMspaceCreate_nid_postfix("result", storage.data(), storage.size(), 0);
+    Require(arena != nullptr);
+    const int owner = 0;
+    Require(rejectsKeepingErrno([&] { sceLibcMspacePosixMemalign_nid_postfix(arena, unmappedResult, 64, 4096); }));
+    Require(sceLibcMspaceIsHeapEmpty_nid_postfix(arena) == 1);
+    Require(rejectsKeepingErrno([&] { sceLibcMspacePosixMemalign_nid_postfix(arena, readOnlyResult, 64, 4096); }));
+    Require(sceLibcMspaceIsHeapEmpty_nid_postfix(arena) == 1 && *readOnlyResult == nullptr);
+    Require(rejectsKeepingErrno([&] { sceLibcPafMspacePosixMemalign_nid_postfix(arena, readOnlyResult, 64, 4096, &owner); }));
+    Require(sceLibcMspaceIsHeapEmpty_nid_postfix(arena) == 1 && *readOnlyResult == nullptr);
+    void* whole = sceLibcMspaceMalloc_nid_postfix(arena, storage.size() - 256);
+    Require(whole != nullptr);
+    sceLibcMspaceFree_nid_postfix(arena, whole);
+    Require(sceLibcMspaceDestroy_nid_postfix(arena) == 0);
+#ifdef _WIN32
+    VirtualFree(page, 0, MEM_RELEASE);
+#else
+    munmap(page, pageSize);
+#endif
+}
+
 int main() {
+    CheckUnwritableResult();
     CheckPaf();
     CheckAlignment();
     CheckAdjacentBlocks();
@@ -205,14 +237,17 @@ int main() {
     Require(sceLibcMspaceCalloc_nid_postfix(arena, std::numeric_limits<std::size_t>::max(), 2) == nullptr);
     sceLibcMspaceFree_nid_postfix(arena, blocker);
     sceLibcMspaceFree_nid_postfix(arena, aligned);
+
     Require(sceLibcMspaceRealloc_nid_postfix(arena, grown, 0) == nullptr);
     void* large = sceLibcMspaceMalloc_nid_postfix(arena, storage.size() - 256);
     Require(large != nullptr); // freeing coalesced all the fragmented blocks
     sceLibcMspaceFree_nid_postfix(arena, large);
+
     void* head = sceLibcMspaceMalloc_nid_postfix(arena, 64);
     Require(head != nullptr && sceLibcMspaceRealloc_nid_postfix(arena, head, 1024) == head);
     Require(sceLibcMspaceMallocUsableSize_nid_postfix(head) == 1024);
     sceLibcMspaceFree_nid_postfix(arena, head);
+
     std::array<void*, 2000> small{};
     for (auto& pointer : small) {
         pointer = sceLibcMspaceMalloc_nid_postfix(arena, 16);
@@ -224,6 +259,7 @@ int main() {
     large = sceLibcMspaceMalloc_nid_postfix(arena, storage.size() - 256);
     Require(large != nullptr);
     sceLibcMspaceFree_nid_postfix(arena, large);
+
     std::array<std::thread, 4> workers;
     for (auto& worker : workers) worker = std::thread([&] {
         for (int i = 0; i < 1000; ++i) {
@@ -232,6 +268,7 @@ int main() {
             std::memset(pointer, 42, 97);
             Require(sceLibcMspaceMallocUsableSize_nid_postfix(pointer) >= 97);
             sceLibcMspaceFree_nid_postfix(arena, pointer);
+
         }
     });
     for (auto& worker : workers) worker.join();
@@ -263,6 +300,7 @@ int main() {
     Require(rounded && (reinterpret_cast<std::uintptr_t>(rounded) & 127) == 0);
     Require(sceLibcMspaceMallocStatsFast_nid_postfix(arena, &stats) == 0 && stats.currentInuseSize >= 100);
     sceLibcMspaceFree_nid_postfix(arena, memaligned);
+
     void* region = sceLibcMspaceMalloc_nid_postfix(arena, 8192);
     Require(region != nullptr);
     Require(sceLibcMspaceCreate_nid_postfix("outside", static_cast<unsigned char*>(region) + 8192, 4096, 0) == nullptr);
@@ -274,6 +312,7 @@ int main() {
     Require(sceLibcMspaceCreate_nid_postfix("flags", storage.data(), storage.size(), 2) == nullptr);
     Require(sceLibcMspaceDestroy_nid_postfix(nested) == 0);
     sceLibcMspaceFree_nid_postfix(arena, region);
+
     Require(sceLibcMspaceDestroy_nid_postfix(arena) == 0);
     Require(sceLibcMspaceMalloc_nid_postfix(arena, 8) == nullptr);
     Require(sceLibcMspaceCreate_nid_postfix("reuse", storage.data(), storage.size(), 0) == arena);

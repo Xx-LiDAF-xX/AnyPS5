@@ -1,4 +1,6 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -34,6 +36,7 @@ alignas(256) constexpr std::array<std::uint32_t, 16> TriangleVertexCode{
     0x7e060280u, 0x7e0802f2u, 0xf80008cfu, 0x04030201u, 0xbf810000u,
 };
 alignas(256) constexpr std::array<std::uint32_t, 10> ArithmeticPixelCode{0xf4000100u, 0xfa000000u, 0xbf8cc07fu, 0x7e000204u, 0x06000002u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 8> DirectBufferPixelCode{0xe0300000u, 0x80000000u, 0xbf8c3f70u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
 alignas(256) std::array<float, 4> PixelConstant{};
 alignas(256) std::array<std::byte, 1024> ColorMemory{};
 
@@ -47,6 +50,7 @@ struct Header {
 alignas(8) Header VertexHeader{};
 alignas(8) Header PixelHeader{};
 alignas(8) Header ArithmeticPixelHeader{};
+alignas(8) Header DirectBufferPixelHeader{};
 
 void Registered(Header& header, const std::uint32_t* code, std::size_t bytes, std::uint8_t type) {
     header.shader.file_header = 0x34333231u;
@@ -83,10 +87,10 @@ void PixelUserData(std::vector<std::uint32_t>& commands, const std::uint32_t* po
     Append(commands, 0x76, {0x00e, unread});
 }
 
-std::vector<std::uint32_t> Setup(bool triangle = false) {
+std::vector<std::uint32_t> Setup(bool triangle = false, const std::uint32_t* pixelCode = nullptr, std::uint32_t pixelUserSgprs = 3) {
     const auto color = reinterpret_cast<std::uintptr_t>(ColorMemory.data());
     const auto vertex = reinterpret_cast<std::uintptr_t>(triangle ? TriangleVertexCode.data() : VertexCode.data());
-    const auto pixel = reinterpret_cast<std::uintptr_t>(triangle ? ArithmeticPixelCode.data() : PixelCode.data());
+    const auto pixel = reinterpret_cast<std::uintptr_t>(pixelCode ? pixelCode : triangle ? ArithmeticPixelCode.data() : PixelCode.data());
     std::vector<std::pair<std::uint32_t, std::uint32_t>> context{
         {0x2d5, 0x2000},
         {0x1b6, 0}, {0x207, 0}, {0x200, 0}, {0x203, 0x800},
@@ -110,7 +114,7 @@ std::vector<std::uint32_t> Setup(bool triangle = false) {
     };
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> shader{
         {0xc8, static_cast<std::uint32_t>(vertex >> 8u)}, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)}, {0x8b, triangle ? 0u : 1u << 1u}, {0x8c, 0},
-        {0x008, static_cast<std::uint32_t>(pixel >> 8u)}, {0x009, static_cast<std::uint32_t>(pixel >> 40u)}, {0x00b, 3u << 1u},
+        {0x008, static_cast<std::uint32_t>(pixel >> 8u)}, {0x009, static_cast<std::uint32_t>(pixel >> 40u)}, {0x00b, pixelUserSgprs << 1u},
     };
     if (triangle) context.insert(context.end(), {{0x2fe, 0}, {0x302, 0}, {0x306, 0}, {0x30a, 0}});
     std::vector<std::uint32_t> commands;
@@ -177,6 +181,21 @@ void UnreadUserWordsKeepTheStage(bool verify) {
     Require(counters.dataHits == moved.dataHits + 1, "a draw that pointed the pixel stage at another buffer descriptor was not a data-only hit: " + Counts(counters));
     Require(counters.dataStagesCompiled - moved.dataStagesCompiled >= 1, "a draw that pointed the pixel stage at another buffer descriptor reused the pixel stage: " + Counts(counters));
     if (!verify) Require(counters.dataStagesReused - moved.dataStagesReused == 1, "a draw that changed only the pixel stage's descriptor pointer did not reuse the vertex stage: " + Counts(counters));
+
+    const bool refresh = std::getenv("APS5_DRAW_PIPELINE") != nullptr;
+    for (const std::uint32_t unread : {0x33u, 0x44u}) {
+        commands.clear();
+        PixelUserData(commands, second, unread);
+        Append(commands, 0x2d, {3, 2});
+        const auto last = counters;
+        counters = Submit(std::move(commands));
+        Require(counters.dataHits == last.dataHits + 1 && counters.inserts == last.inserts, "a draw at the moved pointer with a new unread word: " + Counts(counters));
+        if (verify) continue;
+        const auto compiled = counters.dataStagesCompiled - last.dataStagesCompiled;
+        const bool expectReuse = refresh && unread == 0x44u;
+        Require(compiled == (expectReuse ? 0u : 1u), std::string(expectReuse ? "after a refresh, the draw at the moved pointer compiled its pixel stage again: " : "the draw at the moved pointer did not compile its pixel stage: ") + Counts(counters));
+        Require(counters.shapeUpdates - last.shapeUpdates == (refresh && unread == 0x33u ? 1u : 0u), "shape refreshes: " + std::to_string(counters.shapeUpdates - last.shapeUpdates) + " (" + Counts(counters) + ")");
+    }
 }
 
 unsigned BrightestColorByte() {
@@ -208,6 +227,91 @@ void ReadUserWordsChangeTheOutput() {
     Require(closeTo(second, 191), "a pixel stage adding user word 2 changed to 0.5 wrote " + std::to_string(second) + ", expected 191 (" + Counts(after) + ", before: " + Counts(before) + ")");
 }
 
+void DirectBufferBaseMovesWithItsPayload() {
+    Registered(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(DirectBufferPixelHeader, DirectBufferPixelCode.data(), sizeof(DirectBufferPixelCode), 1);
+    auto* ring = GuestBlock();
+    ColorMemory.fill(std::byte{0});
+    const auto slot = [&](std::size_t index, float value) {
+        auto* data = ring + 1024 + index * 64;
+        data[0] = std::bit_cast<std::uint32_t>(value);
+        return data;
+    };
+    const auto draw = [&](const std::uint32_t* data, bool setup) {
+        auto commands = setup ? Setup(true, DirectBufferPixelCode.data(), 4) : std::vector<std::uint32_t>{};
+        const auto address = reinterpret_cast<std::uintptr_t>(data);
+        Append(commands, 0x76, {0x00c, static_cast<std::uint32_t>(address)});
+        Append(commands, 0x76, {0x00d, static_cast<std::uint32_t>(address >> 32u) & 0xffffu});
+        Append(commands, 0x76, {0x00e, 16});
+        Append(commands, 0x76, {0x00f, 0x3004bfacu});
+        Append(commands, 0x2d, {3, 2});
+        Submit(std::move(commands));
+        return BrightestColorByte();
+    };
+    const auto first = slot(0, 0.25f);
+    const auto second = slot(1, 1.0f);
+    draw(first, true);
+    const auto repeated = draw(first, false);
+    const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    const auto moved = draw(second, false);
+    const auto after = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    Require(moved > repeated, "a draw whose descriptor base and payload both moved read the old payload: " + std::to_string(repeated) + " then " + std::to_string(moved) + " (" + Counts(after) + ", before: " + Counts(before) + ")");
+    Require(after.dataHits == before.dataHits + 1, "a draw whose descriptor base and payload moved was not a data-only hit (" + Counts(after) + ", before: " + Counts(before) + ")");
+    Require(after.dataStagesCompiled - before.dataStagesCompiled >= 1, "a draw whose descriptor base moved reused the pixel stage built for the old base: the rebuild this test documents is gone, flip it to a reuse check (" + Counts(after) + ", before: " + Counts(before) + ")");
+}
+
+void UnreadPixelWordsKeepACompleteStage(bool verify) {
+    alignas(256) static constexpr std::array<std::uint32_t, 6> pixelCode{
+        0x7e000202u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u,
+    };
+    Registered(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(PixelHeader, pixelCode.data(), sizeof(pixelCode), 1);
+    const auto draw = [&](std::uint32_t unread, float value = 0.5f) {
+        auto commands = Setup(true, pixelCode.data(), 3);
+        Append(commands, 0x76, {0x00c, unread});
+        Append(commands, 0x76, {0x00e, std::bit_cast<std::uint32_t>(value)});
+        Append(commands, 0x2d, {3, 2});
+        return Submit(std::move(commands));
+    };
+    draw(0x11);
+    draw(0x11);
+    const auto before = draw(0x11);
+    const auto first = BrightestColorByte();
+    const auto after = draw(0x22);
+    const auto same = BrightestColorByte();
+    draw(0x22, 0.75f);
+    const auto changed = BrightestColorByte();
+    const auto closeTo = [](unsigned actual, unsigned expected) { return actual + 2 >= expected && actual <= expected + 2; };
+    Require(closeTo(first, 128) && closeTo(same, 128) && closeTo(changed, 191),
+            "a direct user word wrote " + std::to_string(first) + "/" + std::to_string(same) + "/" + std::to_string(changed) + ", expected 128/128/191");
+    Require(after.dataHits == before.dataHits + 1, "an unread pixel word did not produce a data-only hit: " + Counts(after));
+    if (verify) Require(after.dataStagesCompiled - before.dataStagesCompiled == 2 && after.dataVerified - before.dataVerified == 2,
+                        "verify mode did not rebuild and compare a stage with no walked user data: " + Counts(before) + " -> " + Counts(after));
+    else Require(after.dataStagesReused - before.dataStagesReused == 2 && after.dataStagesCompiled == before.dataStagesCompiled,
+                 "an unread pixel word rebuilt a stage with no walked user data: " + Counts(before) + " -> " + Counts(after));
+}
+
+void TablesAreKeptOnlyWithTheSwitch(bool expectKept) {
+    Registered(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    auto* table = GuestBlock();
+    auto* data = GuestBlock();
+    data[0] = std::bit_cast<std::uint32_t>(0.25f);
+    const auto address = reinterpret_cast<std::uintptr_t>(data);
+    table[0] = static_cast<std::uint32_t>(address);
+    table[1] = static_cast<std::uint32_t>(address >> 32u) & 0xffffu;
+    table[2] = 16;
+    table[3] = 0x3004bfacu;
+    const auto before = AgcDriver::ShaderMemory::TablesKept();
+    auto commands = Setup(true, PixelCode.data(), 3);
+    PixelUserData(commands, table, 0x11);
+    Append(commands, 0x2d, {3, 2});
+    Submit(std::move(commands));
+    const auto kept = AgcDriver::ShaderMemory::TablesKept() - before;
+    if (expectKept) Require(kept != 0, "a draw handed to the finisher with the table snapshot switch set kept no user-data table");
+    else Require(kept == 0, "a draw kept " + std::to_string(kept) + " user-data tables with the table snapshot switch off");
+}
+
 }
 
 int main() {
@@ -222,6 +326,9 @@ int main() {
         const bool verify = std::getenv("APS5_VERIFY_DRAW_DATA_HITS") != nullptr;
         UnreadUserWordsKeepTheStage(verify);
         ReadUserWordsChangeTheOutput();
+        DirectBufferBaseMovesWithItsPayload();
+        UnreadPixelWordsKeepACompleteStage(verify);
+        if (AgcDriver::DriverDetail::DrawFinisher::Enabled() && !verify) TablesAreKeptOnlyWithTheSwitch(std::getenv("APS5_DRAW_TABLE_SNAPSHOT") != nullptr);
         AgcDriverShutdown_nid_postfix();
         std::cout << "Data-only hits " << (verify ? "verified" : "reused") << " the stages whose read user words did not change\n";
         return 0;

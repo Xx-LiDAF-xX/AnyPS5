@@ -1,5 +1,9 @@
+#include "prx/libSceUlt/include/Api.hpp"
 #include "prx/libSceUlt/src/ReaderWriterLock.hpp"
 #include "prx/libSceUlt/SceUltTypes.hpp"
+#include "prx/libc/include/General.hpp"
+#include <algorithm>
+#include <cerrno>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -7,6 +11,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -16,9 +21,12 @@ struct UltReaderWriterLockState {
     std::uint32_t _readers = 0;
     bool _writing = false;
     std::thread::id _writer{};
+    UltThreadIdentity _ownerIdentity;
     std::uint32_t _waiters = 0;
     bool _alive = true;
     void* _waitingPool = nullptr;
+    char _name[32]{};
+    std::vector<UltWaitRecord> _waiterRecords;
 };
 
 std::mutex gLocksMutex;
@@ -41,10 +49,20 @@ bool HeldByCaller(const UltReaderWriterLockState& state) {
     return state._writing && state._writer == std::this_thread::get_id();
 }
 
-int Wait(UltReaderWriterLockState& state, std::unique_lock<std::mutex>& lock, bool writer) {
+int Wait(UltReaderWriterLockState& state, std::unique_lock<std::mutex>& lock, bool writer, std::int32_t waitValue) {
+    UltWaitRecord record;
+    const bool tracked = CurrentWaitRecord(record, waitValue);
+    if (tracked) state._waiterRecords.push_back(record);
     ++state._waiters;
-    state._released.wait(lock, [&] { return !state._alive || (!state._writing && (!writer || state._readers == 0)); });
+    try {
+        state._released.wait(lock, [&] { return !state._alive || (!state._writing && (!writer || state._readers == 0)); });
+    } catch (...) {
+        --state._waiters;
+        if (tracked) RemoveWaitRecord(state._waiterRecords, record);
+        throw;
+    }
     --state._waiters;
+    if (tracked) RemoveWaitRecord(state._waiterRecords, record);
     return state._alive ? ULT_OK : ULT_ERROR_STATE;
 }
 
@@ -78,7 +96,6 @@ int APS5_VABI sceUltReaderWriterLockOptParamInitialize(UltOptParam* optParam, st
 }
 
 int APS5_VABI sceUltReaderWriterLockCreate(void* rwlock, const char* name, void* waitingQueueResourcePool, const UltOptParam* optParam, std::uint32_t buildVersion) {
-    (void)name;
     (void)optParam;
     (void)buildVersion;
     if (rwlock == nullptr) {
@@ -89,11 +106,12 @@ int APS5_VABI sceUltReaderWriterLockCreate(void* rwlock, const char* name, void*
     }
     auto state = std::make_shared<UltReaderWriterLockState>();
     state->_waitingPool = waitingQueueResourcePool;
+    if (!CopyUltName(state->_name, name)) return ULT_ERROR_NULL;
     std::lock_guard<std::mutex> lock(gLocksMutex);
     if (gLocks.contains(rwlock)) {
         return ULT_ERROR_STATE;
     }
-    std::memset(rwlock, 0, 256);
+    if (!ClearUltObject(rwlock, 256)) return ULT_ERROR_NULL;
     gLocks[rwlock] = std::move(state);
     return ULT_OK;
 }
@@ -125,7 +143,7 @@ int APS5_VABI sceUltReaderWriterLockLockRead(void* rwlock) {
     if (!state->_alive || HeldByCaller(*state)) {
         return ULT_ERROR_STATE;
     }
-    if (const int waited = Wait(*state, lock, false); waited != ULT_OK) return waited;
+    if (const int waited = Wait(*state, lock, false, 1); waited != ULT_OK) return waited;
     ++state->_readers;
     return ULT_OK;
 }
@@ -164,7 +182,8 @@ int APS5_VABI sceUltReaderWriterLockLockWrite(void* rwlock) {
     if (!state->_alive || HeldByCaller(*state)) {
         return ULT_ERROR_STATE;
     }
-    if (const int waited = Wait(*state, lock, true); waited != ULT_OK) return waited;
+    if (const int waited = Wait(*state, lock, true, 2); waited != ULT_OK) return waited;
+    state->_ownerIdentity = UltCurrentOwnerIdentity_nid_no_patch();
     state->_writing = true;
     state->_writer = std::this_thread::get_id();
     return ULT_OK;
@@ -180,6 +199,7 @@ int APS5_VABI sceUltReaderWriterLockTryLockWrite(void* rwlock) {
     if (state->_writing || state->_readers != 0) {
         return ULT_ERROR_BUSY;
     }
+    state->_ownerIdentity = UltCurrentOwnerIdentity_nid_no_patch();
     state->_writing = true;
     state->_writer = std::this_thread::get_id();
     return ULT_OK;
@@ -194,7 +214,52 @@ int APS5_VABI sceUltReaderWriterLockUnlockWrite(void* rwlock) {
     }
     state->_writing = false;
     state->_writer = {};
+    state->_ownerIdentity = {};
     state->_released.notify_all();
+    return ULT_OK;
+}
+
+int APS5_VABI _sceUltReaderWriterLockOptParamInitialize(UltOptParam* optParam, std::uint32_t buildVersion) {
+    return sceUltReaderWriterLockOptParamInitialize(optParam, buildVersion);
+}
+
+int APS5_VABI _sceUltReaderWriterLockCreate(void* rwlock, const char* name, void* waitingQueueResourcePool, const UltOptParam* optParam, std::uint32_t buildVersion) {
+    return sceUltReaderWriterLockCreate(rwlock, name, waitingQueueResourcePool, optParam, buildVersion);
+}
+
+int APS5_VABI sceUltGetReaderWriterLockInfo(void* object, UltReaderWriterLockInfo* info, UltWaitingThreadInfo* waitingThreads, std::uint32_t capacity) {
+    struct RestoreErrno {
+        int value = errno;
+        ~RestoreErrno() { errno = value; }
+    } restore;
+    if (object == nullptr || info == nullptr) return ULT_ERROR_NULL;
+    if (waitingThreads == nullptr && capacity != 0) return ULT_ERROR_NULL;
+    std::shared_ptr<UltReaderWriterLockState> state;
+    if (const int found = FindLock(object, state); found != ULT_OK) return found;
+    std::lock_guard<std::mutex> lock(state->_mutex);
+    if (!state->_alive) return ULT_ERROR_STATE;
+    if (const int status = ValidateWaitRecords(waitingThreads, capacity); status != ULT_OK) return status;
+    UltReaderWriterLockInfo localInfo{};
+    localInfo.size = sizeof(UltReaderWriterLockInfo);
+    localInfo.object = object;
+    std::memcpy(localInfo.name, state->_name, sizeof(localInfo.name));
+    localInfo.waitingQueuePool = state->_waitingPool;
+    localInfo.readers = state->_readers;
+    localInfo.waitingThreads = state->_waiters;
+    localInfo.lockType = state->_writing ? 2 : (state->_readers > 0 ? 1 : 0);
+    localInfo.owner = state->_ownerIdentity.thread;
+    localInfo.ownerType = state->_ownerIdentity.type;
+    const std::size_t count = std::min<std::size_t>(capacity, state->_waiterRecords.size());
+    UltReaderWriterLockInfo previousInfo{};
+    if (count > 0 && !GuestCopyIn_nid_no_patch(&previousInfo, info, sizeof(previousInfo))) return ULT_ERROR_NULL;
+    if (!GuestCopyOut_nid_no_patch(info, &localInfo, sizeof(localInfo))) return ULT_ERROR_NULL;
+    if (count > 0) {
+        const int writeStatus = WriteWaitRecords(state->_waiterRecords, waitingThreads, capacity);
+        if (writeStatus != ULT_OK) {
+            GuestCopyOut_nid_no_patch(info, &previousInfo, sizeof(previousInfo));
+            return writeStatus;
+        }
+    }
     return ULT_OK;
 }
 

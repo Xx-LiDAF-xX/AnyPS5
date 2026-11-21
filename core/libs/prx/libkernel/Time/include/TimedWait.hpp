@@ -4,12 +4,20 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
+
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+#elif !defined(_WIN32)
+#include <semaphore.h>
+#endif
 
 namespace TimedWait {
 
 bool Coarse();
+std::uint64_t TimerLateNanos();
 void BindThreadWaitState(std::atomic<int>* state);
 std::uint64_t NowNanos();
 std::uint64_t DeadlineNanos(std::uint64_t microseconds);
@@ -21,9 +29,6 @@ void WakeChangeSleepers();
 
 struct Waiter;
 
-#ifdef _WIN32
-constexpr unsigned PARK_SPINS = 1000;
-
 class DeliveryDeferral {
 public:
     DeliveryDeferral();
@@ -33,6 +38,15 @@ public:
 };
 
 void DeliverDeferred();
+
+#ifdef _WIN32
+void QueueForDeliveryDrain(unsigned long thread, const std::atomic<bool>* targetFinished, void (*run)(void*), void* argument);
+void ReapDeliveryDrain();
+std::size_t DeliveryDrainPending();
+void SetDeliveryDrainPostHook(void (*hook)());
+
+constexpr unsigned PARK_SPINS = 1000;
+
 void SpinPause();
 Waiter* BeginPark(const void* key);
 bool FinishPark(const void* key, Waiter* waiter, const std::uint64_t* deadlineNanos);
@@ -88,6 +102,7 @@ public:
             return;
         }
 #endif
+        CoarseWaiter registered{coarseWaiters};
         coarse.wait(lock);
     }
 
@@ -102,6 +117,7 @@ public:
             return signaled;
         }
 #endif
+        CoarseWaiter registered{coarseWaiters};
         return coarse.wait_for(lock, std::chrono::microseconds(RemainingMicros(deadlineNanos))) == std::cv_status::no_timeout;
     }
 
@@ -119,6 +135,12 @@ public:
     }
 
 private:
+    struct CoarseWaiter {
+        std::atomic<std::uint32_t>& count;
+        explicit CoarseWaiter(std::atomic<std::uint32_t>& counter) : count(counter) { count.fetch_add(1, std::memory_order_seq_cst); }
+        ~CoarseWaiter() { count.fetch_sub(1, std::memory_order_release); }
+    };
+
 #ifdef _WIN32
     Waiter* enqueue();
     void unlink(Waiter* waiter);
@@ -129,8 +151,54 @@ private:
     Waiter* head = nullptr;
     Waiter* tail = nullptr;
 #endif
+    std::atomic<std::uint32_t> coarseWaiters{0};
     std::condition_variable_any coarse;
 };
+
+#ifdef _WIN32
+using SingleWaiterCondition = Condition;
+#else
+bool DeferDelivery(int signum);
+
+class SingleWaiterCondition {
+public:
+    SingleWaiterCondition();
+    ~SingleWaiterCondition();
+    SingleWaiterCondition(const SingleWaiterCondition&) = delete;
+    SingleWaiterCondition& operator=(const SingleWaiterCondition&) = delete;
+
+    void NotifyOne();
+
+    template <class TLock, class TPredicate>
+    void Wait(TLock& lock, TPredicate predicate) {
+        while (!predicate()) {
+            lock.unlock();
+            waitSignal(nullptr);
+            lock.lock();
+        }
+    }
+
+    template <class TLock, class TPredicate>
+    bool WaitUntil(TLock& lock, std::uint64_t deadlineNanos, TPredicate predicate) {
+        while (!predicate()) {
+            lock.unlock();
+            const bool signaled = waitSignal(&deadlineNanos);
+            lock.lock();
+            if (!signaled) return predicate();
+        }
+        return true;
+    }
+
+private:
+    bool waitSignal(const std::uint64_t* deadlineNanos);
+
+#ifdef __APPLE__
+    dispatch_semaphore_t semaphore;
+#else
+    sem_t semaphore;
+#endif
+};
+#endif
 
 }  // namespace TimedWait
 

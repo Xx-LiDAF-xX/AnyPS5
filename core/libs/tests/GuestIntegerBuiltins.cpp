@@ -1,72 +1,9 @@
+#include "prx/libc/include/Api.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <stdexcept>
-
-using Int128 = __int128;
-using Uint128 = unsigned __int128;
-
-extern "C" {
-std::int64_t APS5_VABI __ashldi3_nid_postfix(std::int64_t, int);
-std::int64_t APS5_VABI __ashrdi3_nid_postfix(std::int64_t, int);
-std::int64_t APS5_VABI __lshrdi3_nid_postfix(std::int64_t, int);
-Int128 APS5_VABI __ashlti3_nid_postfix(Int128, int);
-Int128 APS5_VABI __ashrti3_nid_postfix(Int128, int);
-Int128 APS5_VABI __lshrti3_nid_postfix(Int128, int);
-int APS5_VABI __clzsi2_nid_postfix(std::uint32_t);
-int APS5_VABI __clzdi2_nid_postfix(std::uint64_t);
-int APS5_VABI __clzti2_nid_postfix(Uint128);
-int APS5_VABI __ctzsi2_nid_postfix(std::uint32_t);
-int APS5_VABI __ctzdi2_nid_postfix(std::uint64_t);
-int APS5_VABI __ctzti2_nid_postfix(Uint128);
-int APS5_VABI __ffsdi2_nid_postfix(std::uint64_t);
-int APS5_VABI __ffsti2_nid_postfix(Uint128);
-int APS5_VABI __paritysi2_nid_postfix(std::uint32_t);
-int APS5_VABI __paritydi2_nid_postfix(std::uint64_t);
-int APS5_VABI __parityti2_nid_postfix(Uint128);
-int APS5_VABI __popcountsi2_nid_postfix(std::uint32_t);
-int APS5_VABI __popcountdi2_nid_postfix(std::uint64_t);
-int APS5_VABI __popcountti2_nid_postfix(Uint128);
-int APS5_VABI __cmpdi2_nid_postfix(std::int64_t, std::int64_t);
-int APS5_VABI __cmpti2_nid_postfix(Int128, Int128);
-int APS5_VABI __ucmpdi2_nid_postfix(std::uint64_t, std::uint64_t);
-int APS5_VABI __ucmpti2_nid_postfix(Uint128, Uint128);
-std::int64_t APS5_VABI __negdi2_nid_postfix(std::int64_t);
-Int128 APS5_VABI __negti2_nid_postfix(Int128);
-std::int64_t APS5_VABI __muldi3_nid_postfix(std::int64_t, std::int64_t);
-Int128 APS5_VABI __multi3_nid_postfix(Int128, Int128);
-std::int32_t APS5_VABI __divsi3_nid_postfix(std::int32_t, std::int32_t);
-std::int64_t APS5_VABI __divdi3_nid_postfix(std::int64_t, std::int64_t);
-std::int32_t APS5_VABI __modsi3_nid_postfix(std::int32_t, std::int32_t);
-std::int64_t APS5_VABI __moddi3_nid_postfix(std::int64_t, std::int64_t);
-std::uint32_t APS5_VABI __udivsi3_nid_postfix(std::uint32_t, std::uint32_t);
-std::uint64_t APS5_VABI __udivdi3_nid_postfix(std::uint64_t, std::uint64_t);
-std::uint32_t APS5_VABI __umodsi3_nid_postfix(std::uint32_t, std::uint32_t);
-std::uint64_t APS5_VABI __umoddi3_nid_postfix(std::uint64_t, std::uint64_t);
-std::int32_t APS5_VABI __divmodsi4_nid_postfix(std::int32_t, std::int32_t, std::int32_t*);
-std::int64_t APS5_VABI __divmoddi4_nid_postfix(std::int64_t, std::int64_t, std::int64_t*);
-std::uint32_t APS5_VABI __udivmodsi4_nid_postfix(std::uint32_t, std::uint32_t, std::uint32_t*);
-std::uint64_t APS5_VABI __udivmoddi4_nid_postfix(std::uint64_t, std::uint64_t, std::uint64_t*);
-Uint128 APS5_VABI __udivmodti4_nid_postfix(Uint128, Uint128, Uint128*);
-std::int32_t APS5_VABI __mulosi4_nid_postfix(std::int32_t, std::int32_t, int*);
-std::int64_t APS5_VABI __mulodi4_nid_postfix(std::int64_t, std::int64_t, int*);
-Int128 APS5_VABI __muloti4_nid_postfix(Int128, Int128, int*);
-std::int32_t APS5_VABI __mulvsi3_nid_postfix(std::int32_t, std::int32_t);
-std::int64_t APS5_VABI __mulvdi3_nid_postfix(std::int64_t, std::int64_t);
-Int128 APS5_VABI __mulvti3_nid_postfix(Int128, Int128);
-std::int32_t APS5_VABI __addvsi3_nid_postfix(std::int32_t, std::int32_t);
-std::int64_t APS5_VABI __addvdi3_nid_postfix(std::int64_t, std::int64_t);
-Int128 APS5_VABI __addvti3_nid_postfix(Int128, Int128);
-std::int32_t APS5_VABI __subvsi3_nid_postfix(std::int32_t, std::int32_t);
-std::int64_t APS5_VABI __subvdi3_nid_postfix(std::int64_t, std::int64_t);
-Int128 APS5_VABI __subvti3_nid_postfix(Int128, Int128);
-std::int32_t APS5_VABI __negvsi2_nid_postfix(std::int32_t);
-std::int64_t APS5_VABI __negvdi2_nid_postfix(std::int64_t);
-Int128 APS5_VABI __negvti2_nid_postfix(Int128);
-std::int32_t APS5_VABI __absvsi2_nid_postfix(std::int32_t);
-std::int64_t APS5_VABI __absvdi2_nid_postfix(std::int64_t);
-Int128 APS5_VABI __absvti2_nid_postfix(Int128);
-}
 
 static void Require(bool value) { if (!value) std::abort(); }
 
@@ -214,6 +151,31 @@ static void CheckDivision() {
     Require(__udivmodti4_nid_postfix(0, 5, &remainder128) == 0 && remainder128 == 0);
     Require(__udivmodti4_nid_postfix(Make(~0ull, ~0ull), Make(~0ull, ~0ull), &remainder128) == 1 && remainder128 == 0);
     Require(__udivmodti4_nid_postfix(Make(0, 10), Make(1, 0), &remainder128) == 0 && remainder128 == 10);
+    errno = 71;
+    RequireThrows([] {
+        __divmodsi4_nid_postfix(10, 3, reinterpret_cast<std::int32_t*>(0x10));
+    });
+    Require(errno == 71);
+    errno = 71;
+    RequireThrows([] {
+        __divmoddi4_nid_postfix(10, 3, reinterpret_cast<std::int64_t*>(0x10));
+    });
+    Require(errno == 71);
+    errno = 71;
+    RequireThrows([] {
+        __udivmodsi4_nid_postfix(10, 3, reinterpret_cast<std::uint32_t*>(0x10));
+    });
+    Require(errno == 71);
+    errno = 71;
+    RequireThrows([] {
+        __udivmoddi4_nid_postfix(10, 3, reinterpret_cast<std::uint64_t*>(0x10));
+    });
+    Require(errno == 71);
+    errno = 71;
+    RequireThrows([] {
+        __udivmodti4_nid_postfix(10, 3, reinterpret_cast<Uint128*>(0x10));
+    });
+    Require(errno == 71);
 }
 
 static void CheckOverflow() {
@@ -228,6 +190,21 @@ static void CheckOverflow() {
     Require(__muloti4_nid_postfix(Int128Max, 2, &overflow) == -2 && overflow == 1);
     Require(__muloti4_nid_postfix(static_cast<Int128>(Make(0, 1ull << 63)), -static_cast<Int128>(Make(1, 0)), &overflow) == Int128Min
         && overflow == 0);
+    errno = 71;
+    RequireThrows([] {
+        __mulosi4_nid_postfix(2, 3, reinterpret_cast<int*>(0x10));
+    });
+    Require(errno == 71);
+    errno = 71;
+    RequireThrows([] {
+        __mulodi4_nid_postfix(2, 3, reinterpret_cast<int*>(0x10));
+    });
+    Require(errno == 71);
+    errno = 71;
+    RequireThrows([] {
+        __muloti4_nid_postfix(2, 3, reinterpret_cast<int*>(0x10));
+    });
+    Require(errno == 71);
     Require(__mulvsi3_nid_postfix(-46341, 46340) == -2147441940);
     Require(__mulvdi3_nid_postfix(-4, 5) == -20 && __mulvti3_nid_postfix(-4, 5) == -20);
     RequireThrows([] { __mulvsi3_nid_postfix(46341, 46341); });

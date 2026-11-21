@@ -4,12 +4,15 @@
 #include <zarchive/zarchivereader.h>
 
 #include <algorithm>
+#include <array>
+#include <cerrno>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string_view>
+#include <system_error>
 
 namespace {
 
@@ -35,9 +38,13 @@ bool SameComponent(std::string_view left, std::string_view right) {
 
 Archive& Opened() {
     auto& archive = State();
+    {
+        std::lock_guard lock(archive.mutex);
+        if (archive.opened) return archive;
+    }
+    const auto app0 = ResolveDiskPath_nid_no_patch("/app0").lexically_normal();
     std::lock_guard lock(archive.mutex);
     if (archive.opened) return archive;
-    const auto app0 = ResolveDiskPath_nid_no_patch("/app0").lexically_normal();
     auto candidate = app0;
     candidate += ".zar";
     std::error_code error;
@@ -129,9 +136,41 @@ std::vector<AppArchiveDirectoryEntry> AppArchiveList_nid_no_patch(std::uint32_t 
     for (std::uint32_t index = 0; index < count; ++index) {
         ZArchiveReader::DirEntry entry{};
         if (!reader.GetDirEntry(handle, index, entry)) throw std::runtime_error("app0.zar is damaged: directory entry " + std::to_string(index) + " cannot be read");
-        entries.push_back({std::string(entry.name), entry.isDirectory});
+        entries.push_back({std::string(entry.name), entry.isDirectory, 0, entry.size});
     }
     return entries;
+}
+
+std::vector<AppArchiveDirectoryEntry> AppArchiveListDirectory_nid_no_patch(const std::filesystem::path& hostPath) {
+    AppArchiveNode directory{};
+    if (!AppArchiveLookup_nid_no_patch(hostPath, &directory) || !directory.Directory)
+        throw std::invalid_argument("AppArchiveListDirectory: path is not an app0.zar directory");
+    auto entries = AppArchiveList_nid_no_patch(directory.Handle);
+    for (auto& entry : entries) {
+        AppArchiveNode node{};
+        std::u8string name;
+        name.reserve(entry.Name.size());
+        for (const unsigned char value : entry.Name) name.push_back(static_cast<char8_t>(value));
+        if (!AppArchiveLookup_nid_no_patch(hostPath / std::filesystem::path(name), &node))
+            throw std::runtime_error("app0.zar is damaged: directory child " + entry.Name + " cannot be looked up");
+        entry.Handle = node.Handle;
+        entry.Size = node.Size;
+    }
+    return entries;
+}
+
+std::vector<AppArchiveDirectoryEntry> AppArchiveListUnshadowedDirectory_nid_no_patch(const std::filesystem::path& hostPath, const std::vector<std::string>& hostNames) {
+    auto entries = AppArchiveListDirectory_nid_no_patch(hostPath);
+    entries.erase(std::remove_if(entries.begin(), entries.end(), [&hostNames](const AppArchiveDirectoryEntry& entry) {
+        return std::any_of(hostNames.begin(), hostNames.end(), [&entry](const std::string& name) {
+            return SameComponent(name, entry.Name);
+        });
+    }), entries.end());
+    return entries;
+}
+
+bool AppArchiveNameMatches_nid_no_patch(const std::string& left, const std::string& right) {
+    return SameComponent(left, right);
 }
 
 void AppArchiveReady_nid_no_patch() {
@@ -139,7 +178,8 @@ void AppArchiveReady_nid_no_patch() {
 }
 
 void AppArchiveRefuseOnly_nid_no_patch(const std::filesystem::path& hostPath, const char* guestPath, const char* operation) {
-    if (AppArchiveOnly_nid_no_patch(hostPath)) NotImplemented_nid_no_patch((std::string(operation) + " " + guestPath + " in app0.zar").c_str());
+    if (!AppArchiveOnly_nid_no_patch(hostPath)) return;
+    NotImplemented_nid_no_patch((std::string(operation) + " " + guestPath + " in app0.zar").c_str());
 }
 
 void AppArchiveRefuseMergedListing_nid_no_patch(const std::filesystem::path& hostPath, const char* guestPath) {
@@ -198,6 +238,15 @@ bool AppArchiveDescriptor_nid_no_patch(int descriptor, AppArchiveNode* node, std
     return true;
 }
 
+bool AppArchiveMappingDescriptor_nid_no_patch(int descriptor, std::uint64_t offset, std::uint64_t length, int* backing) {
+    const auto file = Attached(descriptor);
+    if (!file) return false;
+    if (backing == nullptr) throw std::invalid_argument("AppArchiveMappingDescriptor: null output");
+    std::lock_guard lock(file->mutex);
+    *backing = AppArchiveMaterialize_nid_no_patch(file->node, offset, length);
+    return true;
+}
+
 bool AppArchiveDescriptorRead_nid_no_patch(int descriptor, const AppArchiveBuffer* buffers, int count, const std::int64_t* offset, std::uint64_t* read) {
     const auto file = Attached(descriptor);
     if (!file) return false;
@@ -206,15 +255,36 @@ bool AppArchiveDescriptorRead_nid_no_patch(int descriptor, const AppArchiveBuffe
     std::lock_guard lock(file->mutex);
     auto cursor = offset != nullptr ? static_cast<std::uint64_t>(*offset) : file->position;
     std::uint64_t total = 0;
+    std::array<unsigned char, 4096> storage{};
+    const auto finish = [&] {
+        if (offset == nullptr) file->position = cursor;
+        *read = total;
+        return true;
+    };
     for (int i = 0; i < count; ++i) {
-        const auto done = AppArchiveRead_nid_no_patch(file->node.Handle, cursor, buffers[i].Base, buffers[i].Length);
-        cursor += done;
-        total += done;
-        if (done < buffers[i].Length) break;
+        std::size_t done = 0;
+        const auto base = reinterpret_cast<std::uintptr_t>(buffers[i].Base);
+        while (done < buffers[i].Length && cursor < file->node.Size) {
+            if (done > UINTPTR_MAX - base) {
+                if (total != 0) return finish();
+                throw std::system_error(EFAULT, std::generic_category(), "read app0.zar: destination overflow");
+            }
+            const auto address = base + done;
+            const auto amount = std::min({buffers[i].Length - done, storage.size() - (address & (storage.size() - 1)),
+                static_cast<std::size_t>(std::min<std::uint64_t>(storage.size(), file->node.Size - cursor))});
+            const auto copied = AppArchiveRead_nid_no_patch(file->node.Handle, cursor, storage.data(), amount);
+            if (copied != amount) throw std::runtime_error("read app0.zar: inconsistent entry size");
+            if (!GuestCopyOut_nid_no_patch(reinterpret_cast<void*>(address), storage.data(), static_cast<std::size_t>(copied))) {
+                if (total != 0) return finish();
+                throw std::system_error(EFAULT, std::generic_category(), "read app0.zar: unwritable destination");
+            }
+            cursor += copied;
+            total += copied;
+            done += static_cast<std::size_t>(copied);
+        }
+        if (done != buffers[i].Length) break;
     }
-    if (offset == nullptr) file->position = cursor;
-    *read = total;
-    return true;
+    return finish();
 }
 
 bool AppArchiveDescriptorSeek_nid_no_patch(int descriptor, std::int64_t offset, int whence, std::int64_t* position) {

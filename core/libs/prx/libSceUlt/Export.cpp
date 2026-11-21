@@ -1,15 +1,22 @@
+#include "prx/libkernel/Pthread/include/ThreadLifecycle.hpp"
+#include "prx/libkernel/Pthread/include/Cancel.hpp"
+#include "prx/libkernel/include/Api.hpp"
+#include "prx/libSceUlt/include/Api.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cerrno>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cerrno>
 #include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -18,13 +25,7 @@
 #include "SceUltTypes.hpp"
 #include "prx/libSceUlt/src/ReaderWriterLock.hpp"
 
-extern "C" int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, PthreadEntry entry, void* arg, const char* name);
-extern "C" int APS5_VABI scePthreadJoin(Pthread thread, void** retval);
-extern "C" void APS5_VABI scePthreadExit(void* retval);
-extern "C" void APS5_VABI scePthreadYield();
-
 namespace {
-
 
 std::mutex gMutex;
 std::unordered_map<void*, std::shared_ptr<UltMutexState>> gMutexes;
@@ -36,12 +37,11 @@ std::unordered_map<void*, std::shared_ptr<UltQueueState>> gQueues;
 std::unordered_map<void*, UltRuntimeState> gRuntimes;
 std::unordered_map<void*, std::shared_ptr<UltUlthreadState>> gUlthreads;
 
-
 int validateCommonOptParam(const void* optParam) {
     if (optParam == nullptr) return ULT_OK;
     if ((reinterpret_cast<std::uintptr_t>(optParam) & 7u) != 0) return ULT_ERROR_ALIGNMENT;
     UltCommonOptParam value;
-    std::memcpy(&value, optParam, sizeof(value));
+    if (!GuestCopyIn_nid_no_patch(&value, optParam, sizeof(value))) return ULT_ERROR_NULL;
     if (value.header[0] != 0x6C696275 || value.header[1] != 0x6C746D61 || value.header[2] != 0x67696300) return ULT_ERROR_INVALID;
     if (std::any_of(std::begin(value.reserved), std::end(value.reserved), [](std::uint8_t byte) { return byte != 0; })) return ULT_ERROR_INVALID;
     return ULT_OK;
@@ -55,6 +55,13 @@ int semaphoreGetState(void* semaphore, std::shared_ptr<UltSemaphoreState>* out) 
     }
     *out = it->second;
     return ULT_OK;
+}
+
+int semaphoreRequest(void* semaphore, std::int32_t numResource, std::shared_ptr<UltSemaphoreState>* out) {
+    if (semaphore == nullptr) return ULT_ERROR_NULL;
+    if ((reinterpret_cast<std::uintptr_t>(semaphore) & 7u) != 0) return ULT_ERROR_ALIGNMENT;
+    if (numResource <= 0) return ULT_ERROR_RANGE;
+    return semaphoreGetState(semaphore, out);
 }
 
 int queueGetState(void* queue, std::shared_ptr<UltQueueState>* out) {
@@ -77,31 +84,46 @@ int QueueTransfer(void* queue, void* data, const void* source, bool push, bool b
     const auto ready = [&] { return !state->_alive || (push ? pool._free : state->_head) != UINT32_MAX; };
     if (!ready()) {
         if (!blocking) return ULT_ERROR_AGAIN;
-        ++state->_waiters;
+        auto& waiters = push ? state->_waitingPushers : state->_waitingPoppers;
+        auto& records = push ? state->_pusherRecords : state->_popperRecords;
+        UltWaitRecord record;
+        const bool tracked = CurrentWaitRecord(record, push ? 2 : 1);
+        if (tracked) records.push_back(record);
+        ++waiters;
         try {
             (push ? pool._spaceAvailable : state->_dataAvailable).wait(lock, ready);
         } catch (...) {
-            --state->_waiters;
+            --waiters;
+            if (tracked) RemoveWaitRecord(records, record);
             throw;
         }
-        --state->_waiters;
+        --waiters;
+        if (tracked) RemoveWaitRecord(records, record);
         if (!state->_alive) return ULT_ERROR_STATE;
     }
     if (push) {
         const auto slot = pool._free;
-        std::memcpy(pool._data.data() + slot * pool._dataSize, source, state->_dataSize);
+        const int savedErrno = errno;
+        const bool copied = GuestCopyIn_nid_no_patch(pool._data.data() + slot * pool._dataSize, source, state->_dataSize);
+        errno = savedErrno;
+        if (!copied) return ULT_ERROR_NULL;
         pool._free = pool._next[slot];
         pool._next[slot] = UINT32_MAX;
         if (state->_tail == UINT32_MAX) state->_head = slot;
         else pool._next[state->_tail] = slot;
         state->_tail = slot;
+        ++state->_queuedItems;
     } else {
         const auto slot = state->_head;
-        std::memcpy(data, pool._data.data() + slot * pool._dataSize, state->_dataSize);
+        const int savedErrno = errno;
+        const bool copied = GuestCopyOut_nid_no_patch(data, pool._data.data() + slot * pool._dataSize, state->_dataSize);
+        errno = savedErrno;
+        if (!copied) return ULT_ERROR_NULL;
         state->_head = pool._next[slot];
         if (state->_head == UINT32_MAX) state->_tail = UINT32_MAX;
         pool._next[slot] = pool._free;
         pool._free = slot;
+        --state->_queuedItems;
     }
     lock.unlock();
     if (push) state->_dataAvailable.notify_one();
@@ -116,6 +138,7 @@ void ReleaseQueue(UltQueueState& state) {
         pool._free = state._head;
     }
     state._head = state._tail = UINT32_MAX;
+    state._queuedItems = 0;
     state._alive = false;
     --pool._queues;
 }
@@ -130,6 +153,113 @@ void* APS5_VABI ulthreadRunner(void* arg) {
     return reinterpret_cast<void*>(static_cast<std::intptr_t>(result));
 }
 
+void APS5_VABI releaseUlthreadJoin(void* argument) {
+    auto& state = *static_cast<std::shared_ptr<UltUlthreadState>*>(argument);
+    if (!state) return;
+    {
+        std::lock_guard lock(gMutex);
+        state->_joining = false;
+    }
+    state.reset();
+}
+
+int joinUlthread(void* ulthread, std::int32_t* status, bool blocking) {
+    if (ulthread == nullptr) return ULT_ERROR_NULL;
+    std::shared_ptr<UltUlthreadState> state;
+    {
+        std::lock_guard lock(gMutex);
+        const auto it = gUlthreads.find(ulthread);
+        if (it == gUlthreads.end()) return ULT_ERROR_STATE;
+        state = it->second;
+        if (!blocking && !state->_exited.load(std::memory_order_acquire)) return ULT_ERROR_AGAIN;
+        if (state->_joining || state.get() == gCurrentUlthread) return ULT_ERROR_STATE;
+        state->_joining = true;
+    }
+    CleanupHandler cleanup{};
+    bool cleanupRegistered = false;
+    void* result = nullptr;
+    int joined;
+    try {
+        __pthread_cleanup_push_imp_nid_postfix(releaseUlthreadJoin, &state, &cleanup);
+        cleanupRegistered = true;
+        joined = scePthreadJoin(state->_thread, &result);
+    } catch (...) {
+        if (state) {
+            if (cleanupRegistered) __pthread_cleanup_pop_imp_nid_postfix(1);
+            else releaseUlthreadJoin(&state);
+        }
+        throw;
+    }
+    __pthread_cleanup_pop_imp_nid_postfix(0);
+    if (joined != 0) {
+        releaseUlthreadJoin(&state);
+        return ULT_ERROR_STATE;
+    }
+    {
+        std::lock_guard lock(gMutex);
+        const auto it = gUlthreads.find(ulthread);
+        if (it != gUlthreads.end() && it->second == state) gUlthreads.erase(it);
+    }
+    if (status == nullptr) return ULT_OK;
+    const auto exitStatus = static_cast<std::int32_t>(reinterpret_cast<std::intptr_t>(result));
+    const int savedErrno = errno;
+    const bool copied = GuestCopyOut_nid_no_patch(status, &exitStatus, sizeof(exitStatus));
+    errno = savedErrno;
+    return copied ? ULT_OK : ULT_ERROR_NULL;
+}
+
+}
+
+UltThreadIdentity UltCurrentThreadIdentity_nid_no_patch() {
+    if (gCurrentUlthread != nullptr) return {};
+    const auto self = scePthreadSelf();
+    std::uintptr_t thread;
+    std::memcpy(&thread, self, sizeof(thread));
+    return {reinterpret_cast<void*>(thread), 1};
+}
+
+UltThreadIdentity UltCurrentOwnerIdentity_nid_no_patch() {
+    if (gCurrentUlthread == nullptr) return UltCurrentThreadIdentity_nid_no_patch();
+    void* name = nullptr;
+    std::memcpy(&name, gCurrentUlthread->_name, sizeof(name));
+    return {name, 2};
+}
+
+bool CurrentWaitRecord(UltWaitRecord& record, std::int32_t waitValue) {
+    const UltThreadIdentity identity = UltCurrentThreadIdentity_nid_no_patch();
+    if (identity.thread == nullptr) return false;
+    record = {identity.thread, identity.type, waitValue};
+    return true;
+}
+
+void RemoveWaitRecord(std::vector<UltWaitRecord>& records, const UltWaitRecord& record) {
+    const auto found = std::find_if(records.begin(), records.end(), [&](const auto& entry) {
+        return entry.thread == record.thread && entry.type == record.type;
+    });
+    if (found != records.end()) records.erase(found);
+}
+
+int ValidateWaitRecords(const UltWaitingThreadInfo* records, std::uint32_t capacity) {
+    for (std::uint32_t index = 0; index < capacity; ++index) {
+        std::uint64_t size = 0;
+        if (!GuestCopyIn_nid_no_patch(&size, &records[index].size, sizeof(size))) return ULT_ERROR_NULL;
+        if (size != sizeof(UltWaitingThreadInfo)) return ULT_ERROR_INVALID;
+    }
+    return ULT_OK;
+}
+
+int WriteWaitRecords(const std::vector<UltWaitRecord>& records, UltWaitingThreadInfo* destination, std::uint32_t capacity) {
+    const std::size_t count = std::min<std::size_t>(capacity, records.size());
+    if (count == 0) return ULT_OK;
+    std::vector<UltWaitingThreadInfo> infos(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        infos[index].size = sizeof(UltWaitingThreadInfo);
+        infos[index].thread = records[index].thread;
+        infos[index].threadType = records[index].type;
+        infos[index].waitValue = records[index].waitValue;
+    }
+    if (!GuestCopyOut_nid_no_patch(destination, infos.data(), count * sizeof(UltWaitingThreadInfo))) return ULT_ERROR_NULL;
+    return ULT_OK;
 }
 
 bool UltWaitingPoolExists(void* pool) {
@@ -152,6 +282,7 @@ int APS5_VABI sceUltFinalize() {
             return ULT_ERROR_BUSY;
         }
         semaphores.reserve(gSemaphores.size());
+        mutexes.reserve(gMutexes.size());
         for (auto& entry : gSemaphores) {
             auto& state = entry.second;
             std::lock_guard<std::mutex> stateLock(state->_mutex);
@@ -159,7 +290,6 @@ int APS5_VABI sceUltFinalize() {
             semaphores.push_back(state);
         }
         gSemaphores.clear();
-        mutexes.reserve(gMutexes.size());
         for (auto& entry : gMutexes) {
             auto& state = entry.second;
             std::lock_guard<std::mutex> stateLock(state->_mutex);
@@ -203,11 +333,15 @@ int APS5_VABI sceUltMutexOptParamInitialize(UltMutexOptParam* optParam, std::uin
     if ((reinterpret_cast<std::uintptr_t>(optParam) & 7u) != 0) {
         return ULT_ERROR_ALIGNMENT;
     }
-    std::memset(optParam, 0, sizeof(*optParam));
-    optParam->header[0] = 0x6C696275;
-    optParam->header[1] = 0x6C746D61;
-    optParam->header[2] = 0x67696300;
-    optParam->buildVersion = buildVersion;
+    UltMutexOptParam local{};
+    local.header[0] = 0x6C696275;
+    local.header[1] = 0x6C746D61;
+    local.header[2] = 0x67696300;
+    local.buildVersion = buildVersion;
+    const int savedErrno = errno;
+    const bool copied = GuestCopyOut_nid_no_patch(optParam, &local, sizeof(local));
+    errno = savedErrno;
+    if (!copied) return ULT_ERROR_NULL;
     return ULT_OK;
 }
 
@@ -236,15 +370,26 @@ int APS5_VABI sceUltUlthreadOptParamInitialize(UltOptParam* optParam, std::uint3
     return InitializeOptParam(optParam);
 }
 
+int APS5_VABI sceUltConditionVariableOptParamInitialize(UltOptParam* optParam, std::uint32_t buildVersion) {
+    (void)buildVersion;
+    return InitializeOptParam(optParam);
+}
+
+int APS5_VABI _sceUltConditionVariableOptParamInitialize(UltOptParam* optParam, std::uint32_t buildVersion) {
+    return sceUltConditionVariableOptParamInitialize(optParam, buildVersion);
+}
+
 int APS5_VABI sceUltMutexCreate(void* mutex, const char* name, void* waitingQueueResourcePool, const UltMutexOptParam* optParam, std::uint32_t buildVersion) {
-    (void)name;
     (void)buildVersion;
     if (mutex == nullptr) {
         return ULT_ERROR_NULL;
     }
+    std::uint32_t attribute = 0;
+    if (optParam != nullptr && !GuestCopyIn_nid_no_patch(&attribute, &optParam->attribute, sizeof(attribute))) return ULT_ERROR_NULL;
     auto state = std::make_shared<UltMutexState>();
-    state->_attribute = optParam != nullptr ? optParam->attribute : 0;
+    state->_attribute = attribute;
     state->_waitingPool = waitingQueueResourcePool;
+    if (!CopyUltName(state->_name, name)) return ULT_ERROR_NULL;
     std::lock_guard<std::mutex> lock(gMutex);
     if (waitingQueueResourcePool != nullptr && gResourcePools.find(waitingQueueResourcePool) == gResourcePools.end()) {
         return ULT_ERROR_INVALID;
@@ -252,7 +397,7 @@ int APS5_VABI sceUltMutexCreate(void* mutex, const char* name, void* waitingQueu
     if (gMutexes.find(mutex) != gMutexes.end()) {
         return ULT_ERROR_STATE;
     }
-    std::memset(mutex, 0, 256);
+    if (!ClearUltObject(mutex, 256)) return ULT_ERROR_NULL;
     gMutexes[mutex] = std::move(state);
     return ULT_OK;
 }
@@ -292,12 +437,15 @@ int APS5_VABI sceUltMutexLock(void* mutex) {
         return ULT_ERROR_STATE;
     }
     if (state->_owner == self) {
-        if (state->_attribute == 0) {
+        if ((state->_attribute & 1) == 0) {
             return ULT_ERROR_STATE;
         }
         ++state->_lockCount;
         return ULT_OK;
     }
+    UltWaitRecord record;
+    const bool tracked = CurrentWaitRecord(record, 0);
+    if (tracked) state->_waiterRecords.push_back(record);
     ++state->_waiters;
     try {
         state->_available.wait(lock, [&] {
@@ -305,12 +453,15 @@ int APS5_VABI sceUltMutexLock(void* mutex) {
         });
     } catch (...) {
         --state->_waiters;
+        if (tracked) RemoveWaitRecord(state->_waiterRecords, record);
         throw;
     }
     --state->_waiters;
+    if (tracked) RemoveWaitRecord(state->_waiterRecords, record);
     if (!state->_alive) {
         return ULT_ERROR_STATE;
     }
+    state->_ownerIdentity = UltCurrentOwnerIdentity_nid_no_patch();
     state->_owner = self;
     state->_lockCount = 1;
     return ULT_OK;
@@ -332,12 +483,16 @@ int APS5_VABI sceUltMutexTryLock(void* mutex) {
         return ULT_ERROR_STATE;
     }
     if (state->_owner == self) {
+        if ((state->_attribute & 1) == 0) {
+            return ULT_ERROR_STATE;
+        }
         ++state->_lockCount;
         return ULT_OK;
     }
     if (state->_lockCount != 0) {
         return ULT_ERROR_BUSY;
     }
+    state->_ownerIdentity = UltCurrentOwnerIdentity_nid_no_patch();
     state->_owner = self;
     state->_lockCount = 1;
     return ULT_OK;
@@ -364,12 +519,14 @@ int APS5_VABI sceUltMutexUnlock(void* mutex) {
     --state->_lockCount;
     if (state->_lockCount == 0) {
         state->_owner = {};
+        state->_ownerIdentity = {};
         state->_available.notify_one();
     }
     return ULT_OK;
 }
 
-int APS5_VABI _sceUltConditionVariableCreate(void* condition, const char*, void* mutex, const void* optParam, std::uint32_t) {
+int APS5_VABI sceUltConditionVariableCreate(void* condition, const char* name, void* mutex, const void* optParam, std::uint32_t buildVersion) {
+    (void)buildVersion;
     if (condition == nullptr || mutex == nullptr) return ULT_ERROR_NULL;
     if (optParam != nullptr) throw std::runtime_error("ULT condition variable options are not implemented");
     std::lock_guard lock(gMutex);
@@ -378,11 +535,17 @@ int APS5_VABI _sceUltConditionVariableCreate(void* condition, const char*, void*
     if (gConditions.contains(condition)) return ULT_ERROR_STATE;
     auto state = std::make_shared<UltConditionState>();
     state->_mutex = mutexIt->second;
+    state->_mutexObject = mutex;
+    if (!CopyUltName(state->_name, name)) return ULT_ERROR_NULL;
     std::lock_guard stateLock(state->_mutex->_mutex);
     if (!state->_mutex->_alive) return ULT_ERROR_STATE;
     gConditions.emplace(condition, state);
     ++state->_mutex->_conditions;
     return ULT_OK;
+}
+
+int APS5_VABI _sceUltConditionVariableCreate(void* condition, const char* name, void* mutex, const void* optParam, std::uint32_t buildVersion) {
+    return sceUltConditionVariableCreate(condition, name, mutex, optParam, buildVersion);
 }
 
 int APS5_VABI sceUltConditionVariableDestroy(void* condition) {
@@ -399,11 +562,13 @@ int APS5_VABI sceUltConditionVariableDestroy(void* condition) {
 }
 
 int APS5_VABI sceUltConditionVariableSignal(void* condition) {
+    if (condition == nullptr) return ULT_ERROR_NULL;
+    if ((reinterpret_cast<std::uintptr_t>(condition) & 7u) != 0) return ULT_ERROR_ALIGNMENT;
     std::shared_ptr<UltConditionState> state;
     {
         std::lock_guard lock(gMutex);
         const auto it = gConditions.find(condition);
-        if (it == gConditions.end()) return condition == nullptr ? ULT_ERROR_NULL : ULT_ERROR_STATE;
+        if (it == gConditions.end()) return ULT_ERROR_STATE;
         state = it->second;
     }
     std::lock_guard stateLock(state->_mutex->_mutex);
@@ -414,6 +579,24 @@ int APS5_VABI sceUltConditionVariableSignal(void* condition) {
         waiter->_signaled = true;
         waiter->_available.notify_one();
     }
+    return ULT_OK;
+}
+
+int APS5_VABI sceUltConditionVariableSignalAll(void* condition) {
+    std::shared_ptr<UltConditionState> state;
+    {
+        std::lock_guard lock(gMutex);
+        const auto it = gConditions.find(condition);
+        if (it == gConditions.end()) return condition == nullptr ? ULT_ERROR_NULL : ULT_ERROR_STATE;
+        state = it->second;
+    }
+    std::lock_guard stateLock(state->_mutex->_mutex);
+    if (!state->_alive || !state->_mutex->_alive) return ULT_ERROR_STATE;
+    for (auto* waiter : state->_queue) {
+        waiter->_signaled = true;
+        waiter->_available.notify_one();
+    }
+    state->_queue.clear();
     return ULT_OK;
 }
 
@@ -430,24 +613,32 @@ int APS5_VABI sceUltConditionVariableWait(void* condition) {
     std::unique_lock lock(held->_mutex);
     if (!state->_alive || !held->_alive || held->_owner != owner || held->_lockCount == 0) return ULT_ERROR_STATE;
     if (held->_lockCount != 1) throw std::runtime_error("ULT condition wait with a recursively held mutex is not implemented");
+    const auto ownerIdentity = held->_ownerIdentity;
     UltConditionWaiter waiter;
+    waiter._tracked = CurrentWaitRecord(waiter._record, 0);
     state->_queue.push_back(&waiter);
     ++state->_waiters;
     ++held->_conditionWaiters;
     held->_lockCount = 0;
     held->_owner = {};
+    held->_ownerIdentity = {};
     held->_available.notify_one();
     try {
         waiter._available.wait(lock, [&] { return waiter._signaled || !state->_alive || !held->_alive; });
         if (held->_alive && state->_alive) {
+            UltWaitRecord mutexRecord;
+            const bool mutexTracked = CurrentWaitRecord(mutexRecord, 0);
+            if (mutexTracked) held->_waiterRecords.push_back(mutexRecord);
             ++held->_waiters;
             try {
                 held->_available.wait(lock, [&] { return !held->_alive || held->_lockCount == 0; });
             } catch (...) {
                 --held->_waiters;
+                if (mutexTracked) RemoveWaitRecord(held->_waiterRecords, mutexRecord);
                 throw;
             }
             --held->_waiters;
+            if (mutexTracked) RemoveWaitRecord(held->_waiterRecords, mutexRecord);
         }
     } catch (...) {
         state->_queue.remove(&waiter);
@@ -460,6 +651,7 @@ int APS5_VABI sceUltConditionVariableWait(void* condition) {
     --held->_conditionWaiters;
     if (!held->_alive || !state->_alive) return ULT_ERROR_STATE;
     held->_owner = owner;
+    held->_ownerIdentity = ownerIdentity;
     held->_lockCount = 1;
     return ULT_OK;
 }
@@ -469,15 +661,17 @@ std::uint64_t APS5_VABI sceUltWaitingQueueResourcePoolGetWorkAreaSize(std::uint3
 }
 
 int APS5_VABI sceUltWaitingQueueResourcePoolCreate(void* pool, const char* name, std::uint32_t numThreads, std::uint32_t numSyncObjects, void* workArea, const void* optParam, std::uint32_t buildVersion) {
-    (void)name;
     (void)optParam;
     (void)buildVersion;
     if (pool == nullptr) {
         return ULT_ERROR_NULL;
     }
-    std::memset(pool, 0, 256);
+    UltResourcePoolState state{numThreads, numSyncObjects, workArea};
+    if (!CopyUltName(state._name, name)) return ULT_ERROR_NULL;
     std::lock_guard<std::mutex> lock(gMutex);
-    gResourcePools[pool] = {numThreads, numSyncObjects, workArea};
+    if (gResourcePools.contains(pool)) return ULT_ERROR_STATE;
+    if (!ClearUltObject(pool, 256)) return ULT_ERROR_NULL;
+    gResourcePools[pool] = state;
     return ULT_OK;
 }
 
@@ -509,7 +703,7 @@ int APS5_VABI sceUltWaitingQueueResourcePoolDestroy(void* pool) {
     for (const auto& entry : gQueues) {
         if (entry.second->_pool && entry.second->_pool->_waitingPool == pool) {
             std::lock_guard<std::mutex> poolLock(entry.second->_pool->_mutex);
-            if (entry.second->_waiters != 0) {
+            if (entry.second->_waitingPushers != 0 || entry.second->_waitingPoppers != 0) {
                 return ULT_ERROR_STATE;
             }
         }
@@ -530,7 +724,6 @@ std::uint64_t APS5_VABI sceUltQueueDataResourcePoolGetWorkAreaSize(std::uint32_t
 }
 
 int APS5_VABI sceUltQueueDataResourcePoolCreate(void* pool, const char* name, std::uint32_t numData, std::uint64_t dataSize, std::uint32_t numQueueObject, void* waitingQueueResourcePool, void* workArea, const void* optParam, std::uint32_t buildVersion) {
-    (void)name;
     (void)optParam;
     (void)buildVersion;
     if (pool == nullptr) {
@@ -550,14 +743,15 @@ int APS5_VABI sceUltQueueDataResourcePoolCreate(void* pool, const char* name, st
     state->_numQueueObject = numQueueObject;
     state->_waitingPool = waitingQueueResourcePool;
     state->_workArea = workArea;
+    if (!CopyUltName(state->_name, name)) return ULT_ERROR_NULL;
     state->_data.resize(numData * dataSize);
     state->_next.resize(numData);
     for (std::uint32_t slot = 0; slot < numData; ++slot) {
         state->_next[slot] = slot + 1u < numData ? slot + 1u : UINT32_MAX;
     }
     state->_free = 0;
+    if (!ClearUltObject(pool, 512)) return ULT_ERROR_NULL;
     gQueueDataPools.emplace(pool, std::move(state));
-    std::memset(pool, 0, 512);
     return ULT_OK;
 }
 
@@ -574,7 +768,6 @@ int APS5_VABI sceUltQueueDataResourcePoolDestroy(void* pool) {
 }
 
 int APS5_VABI sceUltQueueCreate(void* queue, const char* name, std::uint64_t dataSize, void* waitingQueueResourcePool, void* queueDataResourcePool, const void* optParam, std::uint32_t buildVersion) {
-    (void)name;
     (void)optParam;
     (void)buildVersion;
     if (queue == nullptr) {
@@ -584,6 +777,9 @@ int APS5_VABI sceUltQueueCreate(void* queue, const char* name, std::uint64_t dat
     if (dataSize == 0) return ULT_ERROR_RANGE;
     auto state = std::make_shared<UltQueueState>();
     state->_dataSize = dataSize;
+    state->_waitingPool = waitingQueueResourcePool;
+    state->_dataPool = queueDataResourcePool;
+    if (!CopyUltName(state->_name, name)) return ULT_ERROR_NULL;
     std::lock_guard<std::mutex> lock(gMutex);
     auto dataPoolIt = gQueueDataPools.find(queueDataResourcePool);
     if (dataPoolIt == gQueueDataPools.end()) {
@@ -598,9 +794,9 @@ int APS5_VABI sceUltQueueCreate(void* queue, const char* name, std::uint64_t dat
     std::lock_guard stateLock(pool._mutex);
     if (dataSize > pool._dataSize || waitingQueueResourcePool != pool._waitingPool) return ULT_ERROR_INVALID;
     if (pool._queues == pool._numQueueObject) return ULT_ERROR_BUSY;
+    if (!ClearUltObject(queue, 512)) return ULT_ERROR_NULL;
     gQueues.emplace(queue, std::move(state));
     ++pool._queues;
-    std::memset(queue, 0, 512);
     return ULT_OK;
 }
 
@@ -629,7 +825,7 @@ int APS5_VABI sceUltQueueDestroy(void* queue) {
     auto& pool = *state->_pool;
     {
         std::lock_guard stateLock(pool._mutex);
-        if (state->_waiters != 0) return ULT_ERROR_STATE;
+        if (state->_waitingPushers != 0 || state->_waitingPoppers != 0) return ULT_ERROR_STATE;
         ReleaseQueue(*state);
         gQueues.erase(it);
     }
@@ -638,7 +834,6 @@ int APS5_VABI sceUltQueueDestroy(void* queue) {
 }
 
 int APS5_VABI sceUltSemaphoreCreate(void* semaphore, const char* name, std::uint32_t numInitialResource, void* waitingQueueResourcePool, const void* optParam, std::uint32_t buildVersion) {
-    (void)name;
     (void)optParam;
     (void)buildVersion;
     if (semaphore == nullptr) {
@@ -650,6 +845,7 @@ int APS5_VABI sceUltSemaphoreCreate(void* semaphore, const char* name, std::uint
     auto state = std::make_shared<UltSemaphoreState>();
     state->_resources = std::bit_cast<std::int32_t>(numInitialResource);
     state->_waitingPool = waitingQueueResourcePool;
+    if (!CopyUltName(state->_name, name)) return ULT_ERROR_NULL;
     std::lock_guard<std::mutex> lock(gMutex);
     if (waitingQueueResourcePool != nullptr && gResourcePools.find(waitingQueueResourcePool) == gResourcePools.end()) {
         return ULT_ERROR_INVALID;
@@ -657,28 +853,33 @@ int APS5_VABI sceUltSemaphoreCreate(void* semaphore, const char* name, std::uint
     if (gSemaphores.find(semaphore) != gSemaphores.end()) {
         return ULT_ERROR_STATE;
     }
-    std::memset(semaphore, 0, 256);
+    if (!ClearUltObject(semaphore, 256)) return ULT_ERROR_NULL;
     gSemaphores[semaphore] = std::move(state);
     return ULT_OK;
 }
 
 int APS5_VABI sceUltSemaphoreAcquire(void* semaphore, std::int32_t numResource) {
-    if (semaphore == nullptr) return ULT_ERROR_NULL;
-    if ((reinterpret_cast<std::uintptr_t>(semaphore) & 7u) != 0) return ULT_ERROR_ALIGNMENT;
-    if (numResource <= 0) {
-        return ULT_ERROR_RANGE;
-    }
     std::shared_ptr<UltSemaphoreState> state;
-    if (int ret = semaphoreGetState(semaphore, &state); ret != ULT_OK) {
+    if (int ret = semaphoreRequest(semaphore, numResource, &state); ret != ULT_OK) {
         return ret;
     }
     std::unique_lock<std::mutex> lock(state->_mutex);
     if (!state->_alive) {
         return ULT_ERROR_STATE;
     }
-    state->_waiters++;
-    state->_available.wait(lock, [&] { return !state->_alive || state->_resources >= numResource; });
-    state->_waiters--;
+    UltWaitRecord record;
+    const bool tracked = CurrentWaitRecord(record, 0);
+    if (tracked) state->_waiterRecords.push_back(record);
+    ++state->_waiters;
+    try {
+        state->_available.wait(lock, [&] { return !state->_alive || state->_resources >= numResource; });
+    } catch (...) {
+        --state->_waiters;
+        if (tracked) RemoveWaitRecord(state->_waiterRecords, record);
+        throw;
+    }
+    --state->_waiters;
+    if (tracked) RemoveWaitRecord(state->_waiterRecords, record);
     if (!state->_alive) {
         return ULT_ERROR_STATE;
     }
@@ -687,13 +888,8 @@ int APS5_VABI sceUltSemaphoreAcquire(void* semaphore, std::int32_t numResource) 
 }
 
 int APS5_VABI sceUltSemaphoreTryAcquire(void* semaphore, std::int32_t numResource) {
-    if (semaphore == nullptr) return ULT_ERROR_NULL;
-    if ((reinterpret_cast<std::uintptr_t>(semaphore) & 7u) != 0) return ULT_ERROR_ALIGNMENT;
-    if (numResource <= 0) {
-        return ULT_ERROR_RANGE;
-    }
     std::shared_ptr<UltSemaphoreState> state;
-    if (int ret = semaphoreGetState(semaphore, &state); ret != ULT_OK) {
+    if (int ret = semaphoreRequest(semaphore, numResource, &state); ret != ULT_OK) {
         return ret;
     }
     std::lock_guard<std::mutex> lock(state->_mutex);
@@ -708,13 +904,8 @@ int APS5_VABI sceUltSemaphoreTryAcquire(void* semaphore, std::int32_t numResourc
 }
 
 int APS5_VABI sceUltSemaphoreRelease(void* semaphore, std::int32_t numResource) {
-    if (semaphore == nullptr) return ULT_ERROR_NULL;
-    if ((reinterpret_cast<std::uintptr_t>(semaphore) & 7u) != 0) return ULT_ERROR_ALIGNMENT;
-    if (numResource <= 0) {
-        return ULT_ERROR_RANGE;
-    }
     std::shared_ptr<UltSemaphoreState> state;
-    if (int ret = semaphoreGetState(semaphore, &state); ret != ULT_OK) {
+    if (int ret = semaphoreRequest(semaphore, numResource, &state); ret != ULT_OK) {
         return ret;
     }
     {
@@ -750,11 +941,13 @@ int APS5_VABI sceUltSemaphoreDestroy(void* semaphore) {
 }
 
 int APS5_VABI sceUltUlthreadRuntimeOptParamInitialize(UltUlthreadRuntimeOptParam* optParam, std::uint32_t buildVersion) {
-    (void)buildVersion;
     if (optParam == nullptr) {
         return ULT_ERROR_NULL;
     }
-    std::memset(optParam, 0, sizeof(*optParam));
+    const std::uint32_t defaults[] = {0x6C696275, 0x6C746D61, 0x67696300, buildVersion, 0x4000, 0, 0x1FFF, 0, 0x2BC, 4};
+    UltUlthreadRuntimeOptParam local{};
+    std::memcpy(local.bytes, defaults, sizeof(defaults));
+    if (!GuestCopyOut_nid_no_patch(optParam, &local, sizeof(local))) return ULT_ERROR_NULL;
     return ULT_OK;
 }
 
@@ -767,15 +960,21 @@ std::uint64_t APS5_VABI sceUltUlthreadRuntimeGetWorkAreaSize(std::uint32_t maxNu
 }
 
 int APS5_VABI sceUltUlthreadRuntimeCreate(void* runtime, const char* name, std::uint32_t maxNumUlthread, std::uint32_t numWorkerThread, void* workArea, const void* optParam, std::uint32_t buildVersion) {
-    (void)name;
-    (void)optParam;
     (void)buildVersion;
     if (runtime == nullptr) {
         return ULT_ERROR_NULL;
     }
-    std::memset(runtime, 0, 4096);
+    if (optParam != nullptr) {
+        std::uint32_t header[3];
+        if (!GuestCopyIn_nid_no_patch(header, optParam, sizeof(header))) return ULT_ERROR_NULL;
+        if (header[0] != 0x6C696275 || header[1] != 0x6C746D61 || header[2] != 0x67696300) return ULT_ERROR_INVALID;
+    }
+    UltRuntimeState state{maxNumUlthread, numWorkerThread, workArea};
+    if (!CopyUltName(state._name, name)) return ULT_ERROR_NULL;
     std::lock_guard<std::mutex> lock(gMutex);
-    gRuntimes[runtime] = {maxNumUlthread, numWorkerThread, workArea};
+    if (gRuntimes.contains(runtime)) return ULT_ERROR_STATE;
+    if (!ClearUltObject(runtime, 4096)) return ULT_ERROR_NULL;
+    gRuntimes[runtime] = state;
     return ULT_OK;
 }
 
@@ -792,66 +991,30 @@ int APS5_VABI sceUltUlthreadCreate(void* ulthread, const char* name, UltUlthread
     state->_arg = arg;
     state->_object = ulthread;
     state->_runtime = runtime;
-    {
-        std::lock_guard<std::mutex> lock(gMutex);
-        if (gRuntimes.find(runtime) == gRuntimes.end()) {
-            return ULT_ERROR_STATE;
+    if (!CopyUltName(state->_name, name)) return ULT_ERROR_NULL;
+    std::lock_guard lock(gMutex);
+    if (!gRuntimes.contains(runtime) || gUlthreads.contains(ulthread)) return ULT_ERROR_STATE;
+    const std::string threadName = state->_name;
+    if (!ClearUltObject(ulthread, 512)) return ULT_ERROR_NULL;
+    gUlthreads.emplace(ulthread, state);
+    try {
+        if (scePthreadCreate(&state->_thread, nullptr, ulthreadRunner, state.get(), threadName.c_str()) != 0) {
+            gUlthreads.erase(ulthread);
+            return ULT_ERROR_AGAIN;
         }
-        if (gUlthreads.find(ulthread) != gUlthreads.end()) {
-            return ULT_ERROR_STATE;
-        }
-        std::memset(ulthread, 0, 512);
-        gUlthreads[ulthread] = state;
-    }
-    const int result = scePthreadCreate(&state->_thread, nullptr, ulthreadRunner, state.get(), name != nullptr ? name : "");
-    if (result != 0) {
-        std::lock_guard<std::mutex> lock(gMutex);
-        gUlthreads.erase(ulthread);
-        return ULT_ERROR_AGAIN;
+    } catch (...) {
+        if (state->_thread == nullptr) gUlthreads.erase(ulthread);
+        throw;
     }
     return ULT_OK;
 }
 
 int APS5_VABI sceUltUlthreadJoin(void* ulthread, std::int32_t* status) {
-    if (ulthread == nullptr) {
-        return ULT_ERROR_NULL;
-    }
-    std::shared_ptr<UltUlthreadState> state;
-    {
-        std::lock_guard<std::mutex> lock(gMutex);
-        auto it = gUlthreads.find(ulthread);
-        if (it == gUlthreads.end()) {
-            return ULT_ERROR_STATE;
-        }
-        state = it->second;
-    }
-    void* result = nullptr;
-    if (scePthreadJoin(state->_thread, &result) != 0) {
-        return ULT_ERROR_STATE;
-    }
-    if (status != nullptr) {
-        *status = static_cast<std::int32_t>(reinterpret_cast<std::intptr_t>(result));
-    }
-    std::lock_guard<std::mutex> lock(gMutex);
-    gUlthreads.erase(ulthread);
-    return ULT_OK;
+    return joinUlthread(ulthread, status, true);
 }
 
 int APS5_VABI sceUltUlthreadTryJoin(void* ulthread, std::int32_t* status) {
-    if (ulthread == nullptr) {
-        return ULT_ERROR_NULL;
-    }
-    {
-        std::lock_guard<std::mutex> lock(gMutex);
-        auto it = gUlthreads.find(ulthread);
-        if (it == gUlthreads.end()) {
-            return ULT_ERROR_STATE;
-        }
-        if (!it->second->_exited.load(std::memory_order_acquire)) {
-            return ULT_ERROR_AGAIN;
-        }
-    }
-    return sceUltUlthreadJoin(ulthread, status);
+    return joinUlthread(ulthread, status, false);
 }
 
 int APS5_VABI sceUltUlthreadGetSelf(void** ulthread) {
@@ -861,7 +1024,7 @@ int APS5_VABI sceUltUlthreadGetSelf(void** ulthread) {
     if (gCurrentUlthread == nullptr) {
         return ULT_ERROR_STATE;
     }
-    *ulthread = gCurrentUlthread->_object;
+    if (!GuestCopyOut_nid_no_patch(ulthread, &gCurrentUlthread->_object, sizeof(*ulthread))) return ULT_ERROR_NULL;
     return ULT_OK;
 }
 
@@ -870,6 +1033,7 @@ int APS5_VABI sceUltUlthreadYield() {
         return ULT_ERROR_STATE;
     }
     scePthreadYield();
+
     return ULT_OK;
 }
 
@@ -879,6 +1043,7 @@ int APS5_VABI sceUltUlthreadExit(std::int32_t status) {
     }
     gCurrentUlthread->_exited.store(true, std::memory_order_release);
     scePthreadExit(reinterpret_cast<void*>(static_cast<std::intptr_t>(status)));
+
     return ULT_OK;
 }
 
@@ -900,6 +1065,10 @@ int APS5_VABI sceUltUlthreadRuntimeDestroy(void* runtime) {
     return ULT_OK;
 }
 
+int APS5_VABI _sceUltWaitingQueueResourcePoolOptParamInitialize(UltOptParam* optParam, std::uint32_t buildVersion) {
+    return sceUltWaitingQueueResourcePoolOptParamInitialize(optParam, buildVersion);
+}
+
 int APS5_VABI _sceUltWaitingQueueResourcePoolCreate(void* pool, const char* name, std::uint32_t numThreads, std::uint32_t numSyncObjects, void* workArea, const void* optParam) {
     if (pool == nullptr) return ULT_ERROR_NULL;
     if ((reinterpret_cast<std::uintptr_t>(pool) & 7u) != 0) return ULT_ERROR_ALIGNMENT;
@@ -909,6 +1078,10 @@ int APS5_VABI _sceUltWaitingQueueResourcePoolCreate(void* pool, const char* name
     if ((reinterpret_cast<std::uintptr_t>(workArea) & 7u) != 0) return ULT_ERROR_ALIGNMENT;
     if (workArea == nullptr) return ULT_ERROR_NULL;
     return sceUltWaitingQueueResourcePoolCreate(pool, name, numThreads, numSyncObjects, workArea, optParam, 0);
+}
+
+int APS5_VABI _sceUltSemaphoreOptParamInitialize(UltOptParam* optParam, std::uint32_t buildVersion) {
+    return sceUltSemaphoreOptParamInitialize(optParam, buildVersion);
 }
 
 int APS5_VABI _sceUltSemaphoreCreate(void* semaphore, const char* name, std::uint32_t numInitialResource, void* waitingQueueResourcePool, const void* optParam) {
@@ -929,10 +1102,18 @@ int APS5_VABI _sceUltMutexCreate(void* mutex, const char* name, void* waitingQue
     if (((reinterpret_cast<std::uintptr_t>(mutex) | reinterpret_cast<std::uintptr_t>(optParam) | reinterpret_cast<std::uintptr_t>(waitingQueueResourcePool)) & 7u) != 0) {
         return ULT_ERROR_ALIGNMENT;
     }
-    if (optParam != nullptr && (optParam->header[0] != 0x6C696275 || optParam->header[1] != 0x6C746D61 || optParam->header[2] != 0x67696300 || optParam->attribute > 1 || std::any_of(std::begin(optParam->reserved), std::end(optParam->reserved), [](std::uint32_t value) { return value != 0; }))) {
-        return ULT_ERROR_INVALID;
+    if (optParam != nullptr) {
+        UltMutexOptParam options;
+        if (!GuestCopyIn_nid_no_patch(&options, optParam, sizeof(options))) return ULT_ERROR_NULL;
+        if (options.header[0] != 0x6C696275 || options.header[1] != 0x6C746D61 || options.header[2] != 0x67696300 || options.attribute > 1 || std::any_of(std::begin(options.reserved), std::end(options.reserved), [](std::uint32_t value) { return value != 0; })) {
+            return ULT_ERROR_INVALID;
+        }
     }
     return sceUltMutexCreate(mutex, name, waitingQueueResourcePool, optParam, 0);
+}
+
+int APS5_VABI _sceUltQueueDataResourcePoolOptParamInitialize(UltOptParam* optParam, std::uint32_t buildVersion) {
+    return sceUltQueueDataResourcePoolOptParamInitialize(optParam, buildVersion);
 }
 
 int APS5_VABI _sceUltQueueDataResourcePoolCreate(void* pool, const char* name, std::uint32_t numData, std::uint64_t dataSize, std::uint32_t numQueueObject, void* waitingQueueResourcePool, void* workArea, const void* optParam) {
@@ -944,6 +1125,10 @@ int APS5_VABI _sceUltQueueDataResourcePoolCreate(void* pool, const char* name, s
     if (workArea == nullptr || name == nullptr) return ULT_ERROR_NULL;
     if ((reinterpret_cast<std::uintptr_t>(waitingQueueResourcePool) & 7u) != 0) return ULT_ERROR_ALIGNMENT;
     return sceUltQueueDataResourcePoolCreate(pool, name, numData, dataSize, numQueueObject, waitingQueueResourcePool, workArea, optParam, 0);
+}
+
+int APS5_VABI _sceUltQueueOptParamInitialize(UltOptParam* optParam, std::uint32_t buildVersion) {
+    return sceUltQueueOptParamInitialize(optParam, buildVersion);
 }
 
 int APS5_VABI _sceUltQueueCreate(void* queue, const char* name, std::uint64_t dataSize, void* waitingQueueResourcePool, void* queueDataResourcePool, const void* optParam) {
@@ -967,58 +1152,274 @@ int APS5_VABI _sceUltUlthreadRuntimeCreate(void* runtime, const char* name, std:
     return sceUltUlthreadRuntimeCreate(runtime, name, maxNumUlthread, numWorkerThread, workArea, optParam, 0);
 }
 
+int APS5_VABI _sceUltUlthreadOptParamInitialize(UltOptParam* optParam, std::uint32_t buildVersion) {
+    return sceUltUlthreadOptParamInitialize(optParam, buildVersion);
+}
+
 int APS5_VABI _sceUltUlthreadCreate(void* ulthread, const char* name, UltUlthreadEntry entry, std::uint64_t arg, void* context, std::uint64_t sizeContext, void* runtime, const void* optParam) {
     return sceUltUlthreadCreate(ulthread, name, entry, arg, context, sizeContext, runtime, optParam, 0);
 }
 
-int APS5_VABI sceUltConditionVariableSignalAll(void* conditionVariable) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 int APS5_VABI sceUltGetConditionVariableInfo(void* object, UltConditionVariableInfo* info, UltWaitingThreadInfo* waitingThreads, std::uint32_t capacity) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    struct RestoreErrno {
+        int value = errno;
+        ~RestoreErrno() { errno = value; }
+    } restore;
+    if (object == nullptr || info == nullptr) return ULT_ERROR_NULL;
+    if (waitingThreads == nullptr && capacity != 0) return ULT_ERROR_NULL;
+    std::shared_ptr<UltConditionState> state;
+    {
+        std::lock_guard lock(gMutex);
+        const auto it = gConditions.find(object);
+        if (it == gConditions.end()) return ULT_ERROR_STATE;
+        state = it->second;
+    }
+    std::lock_guard stateLock(state->_mutex->_mutex);
+    if (!state->_alive) return ULT_ERROR_STATE;
+    if (const int status = ValidateWaitRecords(waitingThreads, capacity); status != ULT_OK) return status;
+    UltConditionVariableInfo localInfo{};
+    localInfo.size = sizeof(UltConditionVariableInfo);
+    localInfo.object = object;
+    std::memcpy(localInfo.name, state->_name, sizeof(localInfo.name));
+    localInfo.mutex = state->_mutexObject;
+    localInfo.waitingThreads = static_cast<std::uint32_t>(state->_queue.size());
+    std::vector<UltWaitRecord> records;
+    for (const auto* waiter : state->_queue) {
+        if (waiter->_tracked) records.push_back(waiter->_record);
+    }
+    const std::size_t count = std::min<std::size_t>(capacity, records.size());
+    UltConditionVariableInfo previousInfo{};
+    if (count > 0 && !GuestCopyIn_nid_no_patch(&previousInfo, info, sizeof(previousInfo))) return ULT_ERROR_NULL;
+    if (!GuestCopyOut_nid_no_patch(info, &localInfo, sizeof(localInfo))) return ULT_ERROR_NULL;
+    if (count > 0) {
+        const int writeStatus = WriteWaitRecords(records, waitingThreads, capacity);
+        if (writeStatus != ULT_OK) {
+            GuestCopyOut_nid_no_patch(info, &previousInfo, sizeof(previousInfo));
+            return writeStatus;
+        }
+    }
+    return ULT_OK;
 }
 
 int APS5_VABI sceUltGetMutexInfo(void* object, UltMutexInfo* info, UltWaitingThreadInfo* waitingThreads, std::uint32_t capacity) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    struct RestoreErrno {
+        int value = errno;
+        ~RestoreErrno() { errno = value; }
+    } restore;
+    if (object == nullptr || info == nullptr) return ULT_ERROR_NULL;
+    if (waitingThreads == nullptr && capacity != 0) return ULT_ERROR_NULL;
+    std::shared_ptr<UltMutexState> state;
+    {
+        std::lock_guard lock(gMutex);
+        const auto it = gMutexes.find(object);
+        if (it == gMutexes.end()) return ULT_ERROR_STATE;
+        state = it->second;
+    }
+    std::lock_guard stateLock(state->_mutex);
+    if (!state->_alive) return ULT_ERROR_STATE;
+    if (const int status = ValidateWaitRecords(waitingThreads, capacity); status != ULT_OK) return status;
+    UltMutexInfo localInfo{};
+    localInfo.size = sizeof(UltMutexInfo);
+    localInfo.object = object;
+    std::memcpy(localInfo.name, state->_name, sizeof(localInfo.name));
+    localInfo.waitingQueuePool = state->_waitingPool;
+    localInfo.owner = state->_ownerIdentity.thread;
+    localInfo.ownerType = state->_ownerIdentity.type;
+    localInfo.attributes = state->_attribute;
+    localInfo.lockCount = (state->_attribute & 1) ? state->_lockCount : 0;
+    localInfo.waitingThreads = state->_waiters;
+    const std::size_t count = std::min<std::size_t>(capacity, state->_waiterRecords.size());
+    UltMutexInfo previousInfo{};
+    if (count > 0 && !GuestCopyIn_nid_no_patch(&previousInfo, info, sizeof(previousInfo))) return ULT_ERROR_NULL;
+    if (!GuestCopyOut_nid_no_patch(info, &localInfo, sizeof(localInfo))) return ULT_ERROR_NULL;
+    if (count > 0) {
+        const int writeStatus = WriteWaitRecords(state->_waiterRecords, waitingThreads, capacity);
+        if (writeStatus != ULT_OK) {
+            GuestCopyOut_nid_no_patch(info, &previousInfo, sizeof(previousInfo));
+            return writeStatus;
+        }
+    }
+    return ULT_OK;
 }
 
 int APS5_VABI sceUltGetQueueDataResourcePoolInfo(void* object, UltQueueDataResourcePoolInfo* info) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    if (object == nullptr || info == nullptr) return ULT_ERROR_NULL;
+    std::shared_ptr<UltQueueDataPoolState> state;
+    {
+        std::lock_guard lock(gMutex);
+        const auto it = gQueueDataPools.find(object);
+        if (it == gQueueDataPools.end()) return ULT_ERROR_STATE;
+        state = it->second;
+    }
+    std::lock_guard poolLock(state->_mutex);
+    UltQueueDataResourcePoolInfo localInfo{};
+    localInfo.size = sizeof(UltQueueDataResourcePoolInfo);
+    localInfo.object = object;
+    std::memcpy(localInfo.name, state->_name, sizeof(localInfo.name));
+    localInfo.waitingQueuePool = state->_waitingPool;
+    localInfo.dataSize = state->_dataSize;
+    localInfo.maxItems = state->_numData;
+    localInfo.maxQueues = state->_numQueueObject;
+    localInfo.availableQueues = state->_numQueueObject > state->_queues ? state->_numQueueObject - state->_queues : 0;
+    std::uint32_t freeCount = 0;
+    for (auto next = state->_free; next != UINT32_MAX; next = state->_next[next]) {
+        ++freeCount;
+    }
+    localInfo.availableItems = freeCount;
+    if (!GuestCopyOut_nid_no_patch(info, &localInfo, sizeof(localInfo))) return ULT_ERROR_NULL;
+    return ULT_OK;
 }
 
 int APS5_VABI sceUltGetQueueInfo(void* object, UltQueueInfo* info, UltWaitingThreadInfo* waitingThreads, std::uint32_t capacity) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceUltGetReaderWriterLockInfo(void* object, UltReaderWriterLockInfo* info, UltWaitingThreadInfo* waitingThreads, std::uint32_t capacity) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    struct RestoreErrno {
+        int value = errno;
+        ~RestoreErrno() { errno = value; }
+    } restore;
+    if (object == nullptr || info == nullptr) return ULT_ERROR_NULL;
+    if (waitingThreads == nullptr && capacity != 0) return ULT_ERROR_NULL;
+    std::shared_ptr<UltQueueState> state;
+    {
+        std::lock_guard lock(gMutex);
+        const auto it = gQueues.find(object);
+        if (it == gQueues.end()) return ULT_ERROR_STATE;
+        state = it->second;
+    }
+    auto& pool = *state->_pool;
+    std::lock_guard poolLock(pool._mutex);
+    if (!state->_alive) return ULT_ERROR_STATE;
+    if (const int status = ValidateWaitRecords(waitingThreads, capacity); status != ULT_OK) return status;
+    UltQueueInfo localInfo{};
+    localInfo.size = sizeof(UltQueueInfo);
+    localInfo.object = object;
+    std::memcpy(localInfo.name, state->_name, sizeof(localInfo.name));
+    localInfo.waitingQueuePool = state->_waitingPool;
+    localInfo.dataPool = state->_dataPool;
+    localInfo.dataSize = state->_dataSize;
+    localInfo.queuedItems = state->_queuedItems;
+    localInfo.waitingPushers = state->_waitingPushers;
+    localInfo.waitingPoppers = state->_waitingPoppers;
+    std::vector<UltWaitRecord> records = state->_pusherRecords;
+    records.insert(records.end(), state->_popperRecords.begin(), state->_popperRecords.end());
+    const std::size_t count = std::min<std::size_t>(capacity, records.size());
+    UltQueueInfo previousInfo{};
+    if (count > 0 && !GuestCopyIn_nid_no_patch(&previousInfo, info, sizeof(previousInfo))) return ULT_ERROR_NULL;
+    if (!GuestCopyOut_nid_no_patch(info, &localInfo, sizeof(localInfo))) return ULT_ERROR_NULL;
+    if (count > 0) {
+        const int writeStatus = WriteWaitRecords(records, waitingThreads, capacity);
+        if (writeStatus != ULT_OK) {
+            GuestCopyOut_nid_no_patch(info, &previousInfo, sizeof(previousInfo));
+            return writeStatus;
+        }
+    }
+    return ULT_OK;
 }
 
 int APS5_VABI sceUltGetSemaphoreInfo(void* object, UltSemaphoreInfo* info, UltWaitingThreadInfo* waitingThreads, std::uint32_t capacity) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    struct RestoreErrno {
+        int value = errno;
+        ~RestoreErrno() { errno = value; }
+    } restore;
+    if (object == nullptr || info == nullptr) return ULT_ERROR_NULL;
+    if (waitingThreads == nullptr && capacity != 0) return ULT_ERROR_NULL;
+    std::shared_ptr<UltSemaphoreState> state;
+    {
+        std::lock_guard lock(gMutex);
+        const auto it = gSemaphores.find(object);
+        if (it == gSemaphores.end()) return ULT_ERROR_STATE;
+        state = it->second;
+    }
+    std::lock_guard stateLock(state->_mutex);
+    if (!state->_alive) return ULT_ERROR_STATE;
+    if (const int status = ValidateWaitRecords(waitingThreads, capacity); status != ULT_OK) return status;
+    UltSemaphoreInfo localInfo{};
+    localInfo.size = sizeof(UltSemaphoreInfo);
+    localInfo.object = object;
+    std::memcpy(localInfo.name, state->_name, sizeof(localInfo.name));
+    localInfo.waitingQueuePool = state->_waitingPool;
+    localInfo.resources = static_cast<std::uint32_t>(state->_resources);
+    localInfo.waitingThreads = state->_waiters;
+    const std::size_t count = std::min<std::size_t>(capacity, state->_waiterRecords.size());
+    UltSemaphoreInfo previousInfo{};
+    if (count > 0 && !GuestCopyIn_nid_no_patch(&previousInfo, info, sizeof(previousInfo))) return ULT_ERROR_NULL;
+    if (!GuestCopyOut_nid_no_patch(info, &localInfo, sizeof(localInfo))) return ULT_ERROR_NULL;
+    if (count > 0) {
+        const int writeStatus = WriteWaitRecords(state->_waiterRecords, waitingThreads, capacity);
+        if (writeStatus != ULT_OK) {
+            GuestCopyOut_nid_no_patch(info, &previousInfo, sizeof(previousInfo));
+            return writeStatus;
+        }
+    }
+    return ULT_OK;
 }
 
 int APS5_VABI sceUltGetUlthreadInfo(void* object, UltUlthreadInfo* info) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    if (object == nullptr || info == nullptr) return ULT_ERROR_NULL;
+    std::shared_ptr<UltUlthreadState> state;
+    {
+        std::lock_guard lock(gMutex);
+        const auto it = gUlthreads.find(object);
+        if (it == gUlthreads.end()) return ULT_ERROR_STATE;
+        state = it->second;
+    }
+    UltUlthreadInfo localInfo{};
+    localInfo.size = sizeof(UltUlthreadInfo);
+    localInfo.object = object;
+    std::memcpy(localInfo.name, state->_name, sizeof(localInfo.name));
+    localInfo.runtime = state->_runtime;
+    localInfo.contextAttribute = state->_contextAttribute;
+    const int savedErrno = errno;
+    const bool copied = GuestCopyOut_nid_no_patch(info, &localInfo, sizeof(localInfo));
+    errno = savedErrno;
+    if (!copied) return ULT_ERROR_NULL;
+    return ULT_OK;
 }
 
 int APS5_VABI sceUltGetUlthreadRuntimeInfo(void* runtime, UltUlthreadRuntimeInfo* info, void** ulthreads, std::uint32_t ulthreadCapacity, Pthread* workerThreads, std::uint32_t workerCapacity) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    if (runtime == nullptr || info == nullptr) return ULT_ERROR_NULL;
+    if (ulthreads == nullptr && ulthreadCapacity != 0) return ULT_ERROR_NULL;
+    if (workerThreads == nullptr && workerCapacity != 0) return ULT_ERROR_NULL;
+    if (workerThreads != nullptr && workerCapacity != 0) throw std::runtime_error("ULT ulthread runtime worker thread handles are not implemented");
+    std::lock_guard lock(gMutex);
+    const auto it = gRuntimes.find(runtime);
+    if (it == gRuntimes.end()) return ULT_ERROR_STATE;
+    const auto& state = it->second;
+    UltUlthreadRuntimeInfo localInfo{};
+    localInfo.size = sizeof(UltUlthreadRuntimeInfo);
+    localInfo.object = runtime;
+    std::memcpy(localInfo.name, state._name, sizeof(localInfo.name));
+    localInfo.maxUlthreads = state._maxNumUlthread;
+    localInfo.workerThreads = state._numWorkerThread;
+    std::uint32_t count = 0;
+    for (const auto& [obj, ulthread] : gUlthreads) {
+        if (ulthread->_runtime == runtime && !ulthread->_exited.load(std::memory_order_acquire)) {
+            if (ulthreads != nullptr && count < ulthreadCapacity && !GuestCopyOut_nid_no_patch(&ulthreads[count], &obj, sizeof(obj))) return ULT_ERROR_NULL;
+            ++count;
+        }
+    }
+    localInfo.activeUlthreads = count;
+    const int savedErrno = errno;
+    const bool copied = GuestCopyOut_nid_no_patch(info, &localInfo, sizeof(localInfo));
+    errno = savedErrno;
+    if (!copied) return ULT_ERROR_NULL;
+    return ULT_OK;
 }
 
 int APS5_VABI sceUltGetWaitingQueueResourcePoolInfo(void* object, UltWaitingQueueResourcePoolInfo* info) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    if (object == nullptr || info == nullptr) return ULT_ERROR_NULL;
+    std::lock_guard lock(gMutex);
+    const auto it = gResourcePools.find(object);
+    if (it == gResourcePools.end()) return ULT_ERROR_STATE;
+    const auto& state = it->second;
+    UltWaitingQueueResourcePoolInfo localInfo{};
+    localInfo.size = sizeof(UltWaitingQueueResourcePoolInfo);
+    localInfo.object = object;
+    std::memcpy(localInfo.name, state._name, sizeof(localInfo.name));
+    localInfo.maxThreads = state._numThreads;
+    localInfo.availableThreads = state._numThreads;
+    localInfo.maxSyncObjects = state._numSyncObjects;
+    localInfo.availableSyncObjects = state._numSyncObjects;
+    if (!GuestCopyOut_nid_no_patch(info, &localInfo, sizeof(localInfo))) return ULT_ERROR_NULL;
+    return ULT_OK;
 }
 
 int APS5_VABI sceUltAbstractThreadFactoryCreateThread() {
@@ -1077,22 +1478,6 @@ int APS5_VABI sceUltUlthreadFactoryGetWorkAreaSize() {
 }
 
 int APS5_VABI sceUltUlthreadFactoryInitialize() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceUltConditionVariableCreate() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceUltConditionVariableOptParamInitialize() {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-
-int APS5_VABI _sceUltConditionVariableOptParamInitialize() {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }

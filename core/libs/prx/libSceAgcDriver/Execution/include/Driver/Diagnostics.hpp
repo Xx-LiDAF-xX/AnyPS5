@@ -2,15 +2,18 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DIAGNOSTICS_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
+#include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace AgcDriver::DriverDetail {
 
 double TraceMs();
 
-std::uint64_t SkippedShader();
+bool SkippedShader(std::uint64_t address);
 
 class RefusedDraw final : public std::runtime_error {
 public:
@@ -18,9 +21,22 @@ public:
     std::uint64_t address;
 };
 
+class DrawCompilePending final : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 bool SkipRefusedDraws();
+bool AsyncDrawCompile();
+std::size_t AsyncComputePipelineWords();
 
 void ReportRefusedDraw(const RefusedDraw& refused);
+std::optional<std::size_t> RefusedShaderCount();
+
+bool SkipRefusedDispatches();
+void ReportRefusedDispatch(std::uint64_t address, std::string_view reason);
+bool RefusedDispatch(std::uint64_t address);
+std::size_t MaxComputeSpirvWords();
 
 void require(bool condition, const char* reason);
 
